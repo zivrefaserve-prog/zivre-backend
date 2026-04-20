@@ -72,7 +72,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interva
 
 # Configure CORS properly
 # Get allowed websites from environment variable
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,https://zivre-frontend.vercel.app').split(',')
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://zivre-frontend.vercel.app').split(',')
 
 CORS(app, 
      supports_credentials=True, 
@@ -105,8 +105,8 @@ def admin_required(f):
 @app.after_request
 def after_request(response):
     origin = request.headers.get('Origin')
-    allowed_origins = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,https://zivre-frontend.vercel.app').split(',')
-    if origin in allowed_origins:
+    # Only allow your Vercel frontend
+    if origin == 'https://zivre-frontend.vercel.app':
         response.headers.add('Access-Control-Allow-Origin', origin)
     response.headers.add('Access-Control-Allow-Credentials', 'true')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
