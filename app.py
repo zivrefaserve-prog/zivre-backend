@@ -67,14 +67,6 @@ else:
            
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# ========== ADD THIS CONNECTION POOL SETTINGS HERE ==========
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_pre_ping': True,
-    'pool_recycle': 300,
-    'pool_size': 5,
-    'max_overflow': 10,
-    'pool_timeout': 30
-}
 
 db = SQLAlchemy(app)
 
