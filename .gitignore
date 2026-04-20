@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+uploads/
+zivre.db
+instance/
+.DS_Store
