@@ -68,7 +68,14 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # Configure SocketIO with proper CORS
-socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25, async_mode='eventlet')
+socketio = SocketIO(app, 
+    cors_allowed_origins="*", 
+    ping_timeout=60, 
+    ping_interval=25, 
+    async_mode='eventlet',
+    allow_upgrades=True,  # Add this
+    http_compression=False  # Add this
+)
 
 # Configure CORS properly
 # Get allowed websites from environment variable
