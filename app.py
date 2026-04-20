@@ -75,9 +75,9 @@ socketio = SocketIO(app,
     cors_allowed_origins="*", 
     ping_timeout=60, 
     ping_interval=25, 
-    async_mode='eventlet',
-    allow_upgrades=True,  # Add this
-    http_compression=False  # Add this
+    async_mode='gevent',  # ← CHANGED TO gevent
+    allow_upgrades=True,
+    http_compression=False
 )
 
 # Configure CORS properly
