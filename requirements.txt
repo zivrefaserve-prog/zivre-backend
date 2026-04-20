@@ -10,6 +10,6 @@ Flask-WTF==1.2.1
 bleach==6.2.0
 python-dotenv==1.0.1
 Pillow==10.4.0
-python-magic==0.27
+python-magic==0.4.27
 psycopg2-binary==2.9.9
 gunicorn==21.2.0
