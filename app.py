@@ -2747,13 +2747,13 @@ def init_db():
         print(f"⚠️ Index creation warning: {e}")
     
     # Only run SQLite commands if we're using SQLite (not PostgreSQL)
-if 'sqlite' in str(db.engine.url):
-    try:
-        db.session.execute(text('PRAGMA journal_mode=WAL'))
-        db.session.commit()
-        print("✅ WAL mode enabled")
-    except Exception as e:
-        print(f"⚠️ WAL mode warning: {e}")
+    if 'sqlite' in str(db.engine.url):
+        try:
+            db.session.execute(text('PRAGMA journal_mode=WAL'))
+            db.session.commit()
+            print("✅ WAL mode enabled")
+        except Exception as e:
+            print(f"⚠️ WAL mode warning: {e}")
     
     default_services = [
         ('HVAC Systems', 'Heating, ventilation, and air conditioning maintenance and repair', 500, '❄️'),
