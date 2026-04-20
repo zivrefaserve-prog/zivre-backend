@@ -49,6 +49,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Database configuration
 # Database configuration - automatically handles SQLite locally and PostgreSQL on Render
+# Database configuration
+# Database configuration - automatically handles SQLite locally and PostgreSQL on Render
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if DATABASE_URL:
     # We are on Render.com - use PostgreSQL
@@ -64,6 +66,15 @@ else:
     app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(BASE_DIR, "zivre.db")}'
            
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# ========== ADD THIS CONNECTION POOL SETTINGS HERE ==========
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+    'pool_size': 5,
+    'max_overflow': 10,
+    'pool_timeout': 30
+}
 
 db = SQLAlchemy(app)
 
