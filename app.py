@@ -72,7 +72,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interva
 
 # Configure CORS properly
 # Get allowed websites from environment variable
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,https://zivre-frontend.vercel.app').split(',')
 
 CORS(app, 
      supports_credentials=True, 
