@@ -1,0 +1,2858 @@
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from flask import Flask, request, jsonify, session, send_from_directory
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime, timedelta
+from functools import wraps
+import uuid
+import os
+import re
+import bleach
+import math
+from dotenv import load_dotenv
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from sqlalchemy import text
+import mimetypes
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+app.config['SESSION_COOKIE_DOMAIN'] = None
+app.config['SESSION_COOKIE_PATH'] = '/'
+app.config['SESSION_COOKIE_SECURE'] = False
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_PERMANENT'] = True
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
+app.config['SESSION_REFRESH_EACH_REQUEST'] = True
+
+# File upload configuration
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'mp3', 'm4a', 'wav', 'mp4', 'pdf', 'doc', 'docx', 'txt', 'xlsx', 'pptx', 'csv', 'zip', 'rar'}
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Database configuration
+# Database configuration - automatically handles SQLite locally and PostgreSQL on Render
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if DATABASE_URL:
+    # We are on Render.com - use PostgreSQL
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+    # Fix for Neon.tech (add SSL if needed)
+    if 'neon.tech' in DATABASE_URL and 'sslmode' not in DATABASE_URL:
+        if '?' in DATABASE_URL:
+            app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL + '&sslmode=require'
+        else:
+            app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL + '?sslmode=require'
+else:
+    # We are on your computer - use SQLite
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(BASE_DIR, "zivre.db")}'
+           
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+# Configure SocketIO with proper CORS
+socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25, async_mode='eventlet')
+
+# Configure CORS properly
+# Get allowed websites from environment variable
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
+
+CORS(app, 
+     supports_credentials=True, 
+     origins=ALLOWED_ORIGINS,
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+     expose_headers=["Content-Type", "Set-Cookie"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+
+limiter = Limiter(get_remote_address, app=app, default_limits=["1000000 per day", "100000 per hour", "10000 per minute"], storage_uri=os.environ.get('RATELIMIT_STORAGE_URL', 'memory://'))
+
+# ==================== ADMIN REQUIRED DECORATOR ====================
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user_id = session.get('user_id')
+        print(f"🔐 Admin check - Session user_id: {user_id}, Session contents: {dict(session)}")
+        
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        user = db.session.get(User, user_id)
+        if not user or user.role != 'admin':
+            return jsonify({'error': 'Admin access required'}), 403
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Add after request handler to ensure session is saved
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', 'http://localhost:3000')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# ==================== DATABASE MODELS ====================
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    password = db.Column(db.String(200), nullable=False)
+    full_name = db.Column(db.String(100), nullable=False)
+    phone = db.Column(db.String(20), nullable=False)
+    role = db.Column(db.String(20), nullable=False, index=True)
+    is_active = db.Column(db.Boolean, default=True)
+    is_verified = db.Column(db.Boolean, default=False)
+    rating = db.Column(db.Float, default=0)
+    total_jobs = db.Column(db.Integer, default=0)
+    reset_token = db.Column(db.String(100), nullable=True)
+    reset_expiry = db.Column(db.DateTime, nullable=True)
+    is_online = db.Column(db.Boolean, default=False)
+    is_online_manual = db.Column(db.Boolean, default=False)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    avatar = db.Column(db.String(500), nullable=True)
+    service_specialization_id = db.Column(db.Integer, db.ForeignKey('services.id'), nullable=True)
+    
+    service_specialization = db.relationship('Service', foreign_keys=[service_specialization_id])
+
+
+class Service(db.Model):
+    __tablename__ = 'services'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(500), nullable=False)
+    total_price = db.Column(db.Float, nullable=False, default=0)
+    provider_payout = db.Column(db.Float, nullable=False, default=0)
+    admin_fee = db.Column(db.Float, nullable=False, default=0)
+    site_fee = db.Column(db.Float, nullable=False, default=0)
+    icon = db.Column(db.String(10), nullable=False)
+    is_active = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Quote(db.Model):
+    __tablename__ = 'quotes'
+    id = db.Column(db.Integer, primary_key=True)
+    full_name = db.Column(db.String(100), nullable=False)
+    phone = db.Column(db.String(20), nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    service_type = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(200), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class ServiceRequest(db.Model):
+    __tablename__ = 'service_requests'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    service_id = db.Column(db.Integer, db.ForeignKey('services.id', ondelete='CASCADE'), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    provider_payout = db.Column(db.Float, nullable=False, default=0)
+    admin_fee = db.Column(db.Float, nullable=False, default=0)
+    site_fee = db.Column(db.Float, nullable=False, default=0)
+    status = db.Column(db.String(30), default='pending_approval', index=True)
+    location_address = db.Column(db.String(200), nullable=False, default='')
+    location_city = db.Column(db.String(100), nullable=False, default='')
+    location_region = db.Column(db.String(100), nullable=False, default='')
+    location_landmark = db.Column(db.String(200), nullable=True)
+    customer_phone = db.Column(db.String(20), nullable=False, default='')
+    provider_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    rating = db.Column(db.Integer, nullable=True)
+    customer_confirmed = db.Column(db.Boolean, default=False)
+    provider_completed = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    assigned_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    service = db.relationship('Service')
+    provider = db.relationship('User', foreign_keys=[provider_id])
+
+
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    message = db.Column(db.String(500), nullable=False)
+    type = db.Column(db.String(50), default='info')
+    link = db.Column(db.String(200), nullable=True)
+    read = db.Column(db.Boolean, default=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+
+class Message(db.Model):
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    receiver_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    subject = db.Column(db.String(200), nullable=True)
+    message = db.Column(db.Text, nullable=False)
+    attachment_path = db.Column(db.String(500), nullable=True)
+    attachment_type = db.Column(db.String(50), nullable=True)
+    attachment_name = db.Column(db.String(200), nullable=True)
+    reply_to_id = db.Column(db.Integer, db.ForeignKey('messages.id', ondelete='SET NULL'), nullable=True)
+    is_read = db.Column(db.Boolean, default=False)
+    is_delivered = db.Column(db.Boolean, default=False)
+    is_deleted_for_sender = db.Column(db.Boolean, default=False)
+    is_deleted_for_receiver = db.Column(db.Boolean, default=False)
+    read_at = db.Column(db.DateTime, nullable=True)
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, nullable=True)
+    
+    sender = db.relationship('User', foreign_keys=[sender_id])
+    receiver = db.relationship('User', foreign_keys=[receiver_id])
+    reply_to = db.relationship('Message', remote_side=[id], backref='replies')
+
+
+class Comment(db.Model):
+    __tablename__ = 'comments'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    user_name = db.Column(db.String(100), nullable=False)
+    user_role = db.Column(db.String(20), default='customer')
+    user_avatar = db.Column(db.String(10), nullable=True)
+    rating = db.Column(db.Float, default=5)
+    comment = db.Column(db.Text, nullable=False)
+    is_approved = db.Column(db.Boolean, default=True)
+    helpful_count = db.Column(db.Integer, default=0)
+    not_helpful_count = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+
+
+class CommentReply(db.Model):
+    __tablename__ = 'comment_replies'
+    id = db.Column(db.Integer, primary_key=True)
+    comment_id = db.Column(db.Integer, db.ForeignKey('comments.id', ondelete='CASCADE'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    user_name = db.Column(db.String(100), nullable=False)
+    user_role = db.Column(db.String(20), default='customer')
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    comment = db.relationship('Comment', foreign_keys=[comment_id])
+    user = db.relationship('User', foreign_keys=[user_id])
+
+
+class SystemSetting(db.Model):
+    __tablename__ = 'system_settings'
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.String(500), nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ==================== PERCENTAGE SETTINGS MODEL ====================
+
+class PercentageSetting(db.Model):
+    __tablename__ = 'percentage_settings'
+    id = db.Column(db.Integer, primary_key=True)
+    provider_percent = db.Column(db.Float, default=60.0, nullable=False)
+    admin_percent = db.Column(db.Float, default=25.0, nullable=False)
+    site_fee_percent = db.Column(db.Float, default=15.0, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+
+    def get_total(self):
+        return self.provider_percent + self.admin_percent + self.site_fee_percent
+    
+    def is_valid(self):
+        total = self.get_total()
+        return abs(total - 100.0) < 0.01
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_file_type(filename):
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    
+    image_exts = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'}
+    audio_exts = {'mp3', 'm4a', 'wav', 'ogg', 'flac'}
+    video_exts = {'mp4', 'mov', 'avi', 'mkv', 'webm'}
+    document_exts = {'pdf', 'doc', 'docx', 'txt', 'xlsx', 'pptx', 'csv'}
+    
+    if ext in image_exts:
+        return 'image'
+    elif ext in audio_exts:
+        return 'audio'
+    elif ext in video_exts:
+        return 'video'
+    elif ext in document_exts:
+        return 'document'
+    return 'file'
+
+def create_notification(user_id, message, type='info', link=None):
+    try:
+        notification = Notification(user_id=user_id, message=message, type=type, link=link)
+        db.session.add(notification)
+        db.session.commit()
+        
+        try:
+            socketio.emit('new_notification', {
+                'user_id': user_id,
+                'message': message,
+                'type': type,
+                'link': link
+            }, room=f"user_{user_id}")
+        except Exception as e:
+            print(f"WebSocket emit error (non-critical): {e}")
+        
+        return True
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating notification: {str(e)}")
+        return False
+
+def delete_all_notifications(user_id):
+    try:
+        deleted_count = Notification.query.filter_by(user_id=user_id).delete()
+        db.session.commit()
+        return deleted_count
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error deleting all notifications: {str(e)}")
+        return 0
+
+def mark_all_notifications_read(user_id):
+    try:
+        updated_count = Notification.query.filter_by(user_id=user_id, read=False).update({'read': True})
+        db.session.commit()
+        return updated_count
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error marking all notifications read: {str(e)}")
+        return 0
+
+def validate_email(email):
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def validate_password(password):
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters"
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter"
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter"
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one number"
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "Password must contain at least one special character"
+    return True, "Password is valid"
+
+def get_current_percentages():
+    setting = PercentageSetting.query.first()
+    if not setting:
+        setting = PercentageSetting(provider_percent=60.0, admin_percent=25.0, site_fee_percent=15.0)
+        db.session.add(setting)
+        db.session.commit()
+    return setting
+
+
+# ==================== EMAIL HELPER FUNCTION ====================
+
+def send_reset_email(user_email, user_name, reset_token):
+    try:
+        frontend_url = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+        reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+        
+        print(f"\n{'='*60}")
+        print(f"🔐 PASSWORD RESET LINK (copy this URL to reset password):")
+        print(f"{reset_link}")
+        print(f"{'='*60}\n")
+        
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        smtp_username = "zivrefaserve@gmail.com"
+        smtp_password = "jmivcbvhipysvgcl"
+        
+        subject = "Reset Your Zivre Password"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"></head>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #10b981;">Reset Your Password</h2>
+                <p>Hello {user_name},</p>
+                <p>Click the button below to reset your password. This link expires in 1 hour.</p>
+                <a href="{reset_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Reset Password</a>
+                <p>Or copy this link: {reset_link}</p>
+                <p>If you didn't request this, please ignore this email.</p>
+                <p>Thanks,<br>Zivre Team</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        msg = MIMEMultipart('alternative')
+        msg['From'] = smtp_username
+        msg['To'] = user_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"✅ Email sent to {user_email}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Email error: {str(e)}")
+        return True
+
+
+# ==================== WEBSOCKET EVENTS ====================
+
+@socketio.on('connect')
+def handle_connect():
+    user_id = request.args.get('userId')
+    print(f"🔌 WebSocket connect attempt - User ID: {user_id}")
+    
+    if user_id and user_id.isdigit():
+        user = db.session.get(User, int(user_id))
+        if user:
+            user.is_online = True
+            user.last_seen = datetime.utcnow()
+            db.session.commit()
+            join_room(f"user_{user_id}")
+            join_room(f"role_{user.role}")
+            print(f"✅ User {user.full_name} connected to WebSocket")
+            emit('user_status', {'userId': user_id, 'isOnline': True})
+            return True
+    
+    print(f"🔴 WebSocket connection rejected")
+    return False
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    user_id = request.args.get('userId')
+    print(f"🔴 WebSocket disconnect - User ID: {user_id}")
+    
+    if user_id and user_id.isdigit():
+        user = db.session.get(User, int(user_id))
+        if user:
+            user.is_online = False
+            user.last_seen = datetime.utcnow()
+            db.session.commit()
+            emit('user_status', {'userId': user_id, 'isOnline': False})
+
+@socketio.on('ping')
+def handle_ping(data):
+    emit('pong', {'server': 'zivre-backend', 'time': datetime.utcnow().isoformat()})
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    sender_id = int(request.args.get('userId'))
+    receiver_id = data.get('receiverId')
+    message_text = data.get('message')
+    message_id = data.get('messageId')
+    reply_to_id = data.get('replyToId')
+    
+    sender = db.session.get(User, sender_id)
+    receiver = db.session.get(User, receiver_id)
+    
+    if not sender or not receiver:
+        emit('error', {'message': 'User not found'})
+        return
+    
+    if sender.role == 'customer' and receiver.role == 'customer':
+        emit('error', {'message': 'Customers cannot message other customers'})
+        return
+    
+    if sender.role == 'provider' and receiver.role == 'provider':
+        emit('error', {'message': 'Providers cannot message other providers'})
+        return
+    
+    if sender.role == 'customer' and receiver.role == 'provider':
+        assigned_job = ServiceRequest.query.filter(
+            ServiceRequest.provider_id == receiver_id, 
+            ServiceRequest.user_id == sender_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed'])
+        ).first()
+        if not assigned_job:
+            emit('error', {'message': 'You can only message providers assigned to your active or completed jobs'})
+            return
+    
+    if sender.role == 'provider' and receiver.role == 'customer':
+        assigned_job = ServiceRequest.query.filter(
+            ServiceRequest.provider_id == sender_id, 
+            ServiceRequest.user_id == receiver_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed'])
+        ).first()
+        if not assigned_job:
+            emit('error', {'message': 'You can only message customers assigned to your active or completed jobs'})
+            return
+    
+    new_message = Message(
+        sender_id=sender_id,
+        receiver_id=receiver_id,
+        subject=data.get('subject', ''),
+        message=bleach.clean(message_text) if message_text else '',
+        reply_to_id=reply_to_id,
+        is_delivered=False,
+        is_read=False
+    )
+    db.session.add(new_message)
+    db.session.commit()
+    
+    emit('new_message', {
+        'id': new_message.id,
+        'sender_id': sender_id,
+        'sender_name': sender.full_name,
+        'sender_role': sender.role,
+        'receiver_id': receiver_id,
+        'receiver_name': receiver.full_name,
+        'receiver_role': receiver.role,
+        'message': new_message.message,
+        'reply_to_id': reply_to_id,
+        'created_at': new_message.created_at.isoformat(),
+        'temp_id': message_id
+    }, room=f"user_{receiver_id}")
+    
+    emit('message_delivered', {
+        'message_id': new_message.id,
+        'temp_id': message_id,
+        'status': 'delivered'
+    }, room=f"user_{sender_id}")
+    
+    create_notification(receiver_id, f'New message from {sender.full_name}', 'message', '/messages')
+
+
+@socketio.on('typing')
+def handle_typing(data):
+    sender_id = int(request.args.get('userId'))
+    receiver_id = data.get('receiverId')
+    is_typing = data.get('isTyping')
+    
+    emit('typing', {
+        'sender_id': sender_id,
+        'isTyping': is_typing
+    }, room=f"user_{receiver_id}")
+
+@socketio.on('mark_read')
+def handle_mark_read(data):
+    user_id = int(request.args.get('userId'))
+    message_id = data.get('messageId')
+    sender_id = data.get('senderId')
+    
+    message = db.session.get(Message, message_id)
+    if message and message.receiver_id == user_id and not message.is_read:
+        message.is_read = True
+        message.read_at = datetime.utcnow()
+        db.session.commit()
+        
+        emit('message_read', {
+            'message_id': message_id,
+            'sender_id': sender_id
+        }, room=f"user_{sender_id}")
+
+@socketio.on('mark_delivered')
+def handle_mark_delivered(data):
+    user_id = int(request.args.get('userId'))
+    message_id = data.get('messageId')
+    sender_id = data.get('senderId')
+    
+    message = db.session.get(Message, message_id)
+    if message and message.receiver_id == user_id and not message.is_delivered:
+        message.is_delivered = True
+        message.delivered_at = datetime.utcnow()
+        db.session.commit()
+        
+        emit('message_delivered', {
+            'message_id': message_id,
+            'sender_id': sender_id
+        }, room=f"user_{sender_id}")
+
+
+# ==================== PERCENTAGE SETTINGS ROUTES ====================
+
+@app.route('/api/settings/percentages', methods=['GET'])
+def get_percentages():
+    setting = get_current_percentages()
+    
+    return jsonify({
+        'provider_percent': setting.provider_percent,
+        'admin_percent': setting.admin_percent,
+        'site_fee_percent': setting.site_fee_percent,
+        'total': setting.get_total(),
+        'is_valid': setting.is_valid(),
+        'updated_at': setting.updated_at.isoformat() if setting.updated_at else None
+    })
+
+
+@app.route('/api/admin/settings/percentages', methods=['PUT'])
+@admin_required
+def update_percentages():
+    data = request.json
+    admin_user_id = session.get('user_id')
+    
+    try:
+        provider = float(data.get('provider_percent', 60))
+        admin = float(data.get('admin_percent', 25))
+        site_fee = float(data.get('site_fee_percent', 15))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid percentage values'}), 400
+    
+    total = provider + admin + site_fee
+    if abs(total - 100) > 0.01:
+        return jsonify({'error': f'Percentages must sum to 100%. Current total: {total}%'}), 400
+    
+    if not all(0 <= p <= 100 for p in [provider, admin, site_fee]):
+        return jsonify({'error': 'Each percentage must be between 0 and 100'}), 400
+    
+    setting = get_current_percentages()
+    setting.provider_percent = provider
+    setting.admin_percent = admin
+    setting.site_fee_percent = site_fee
+    setting.updated_by = admin_user_id
+    db.session.commit()
+    
+    socketio.emit('percentages_updated', {
+        'provider_percent': provider,
+        'admin_percent': admin,
+        'site_fee_percent': site_fee,
+        'total': total
+    })
+    
+    return jsonify({
+        'message': 'Percentages updated successfully',
+        'percentages': {
+            'provider_percent': provider,
+            'admin_percent': admin,
+            'site_fee_percent': site_fee,
+            'total': total
+        }
+    })
+
+
+# ==================== AUTH ROUTES ====================
+
+@app.route('/api/auth/signup', methods=['POST'])
+@limiter.limit("10 per minute")
+def signup():
+    data = request.json
+    
+    if User.query.filter_by(email=data.get('email')).first():
+        return jsonify({'error': 'Email already exists'}), 400
+    
+    if not validate_email(data.get('email')):
+        return jsonify({'error': 'Invalid email format'}), 400
+    
+    is_valid, password_msg = validate_password(data.get('password'))
+    if not is_valid:
+        return jsonify({'error': password_msg}), 400
+    
+    hashed_password = generate_password_hash(data.get('password'))
+    
+    service_specialization_id = data.get('service_specialization')
+    
+    if data.get('role') == 'provider' and service_specialization_id:
+        service = db.session.get(Service, service_specialization_id)
+        if not service:
+            return jsonify({'error': 'Selected service specialization does not exist'}), 400
+        if not service.is_active:
+            return jsonify({'error': 'Selected service is not active'}), 400
+    
+    new_user = User(
+        email=data.get('email'),
+        password=hashed_password,
+        full_name=data.get('full_name'),
+        phone=data.get('phone'),
+        role=data.get('role', 'customer'),
+        service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
+        is_verified=False if data.get('role') == 'provider' else True
+    )
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'User created successfully',
+        'user': {
+            'id': new_user.id,
+            'email': new_user.email,
+            'full_name': new_user.full_name,
+            'role': new_user.role,
+            'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None
+        }
+    })
+
+
+@app.route('/api/auth/login', methods=['POST'])
+@limiter.limit("10 per minute")
+def login():
+    data = request.json
+    user = User.query.filter_by(email=data.get('email')).first()
+    
+    if not user or not check_password_hash(user.password, data.get('password')):
+        return jsonify({'error': 'Invalid email or password'}), 401
+    
+    if not user.is_active:
+        return jsonify({'error': 'Account has been suspended'}), 401
+    
+    session.clear()
+    session['user_id'] = user.id
+    session['role'] = user.role
+    session.permanent = True
+    
+    print(f"✅ Login successful for user {user.email}, session: {dict(session)}")
+    
+    return jsonify({
+        'message': 'Login successful',
+        'user': {
+            'id': user.id,
+            'email': user.email,
+            'full_name': user.full_name,
+            'phone': user.phone,
+            'role': user.role,
+            'is_verified': user.is_verified,
+            'rating': user.rating,
+            'total_jobs': user.total_jobs,
+            'service_specialization': user.service_specialization.name if user.service_specialization else None,
+            'service_specialization_id': user.service_specialization_id
+        }
+    })
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'message': 'Logged out successfully'})
+
+@app.route('/api/auth/forgot-password', methods=['POST'])
+def forgot_password():
+    data = request.json
+    email = data.get('email')
+    
+    print(f"📧 Forgot password request for email: {email}")
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+    
+    user = User.query.filter_by(email=email).first()
+    
+    if not user:
+        print(f"❌ Email not found: {email}")
+        return jsonify({'error': 'Email not found'}), 404
+    
+    reset_token = str(uuid.uuid4())
+    user.reset_token = reset_token
+    user.reset_expiry = datetime.utcnow() + timedelta(hours=1)
+    db.session.commit()
+    
+    print(f"✅ Generated reset token for {email}: {reset_token}")
+    
+    try:
+        send_reset_email(user.email, user.full_name, reset_token)
+    except Exception as e:
+        print(f"Email error but continuing: {e}")
+    
+    return jsonify({'message': 'Password reset link has been sent to your email address.'})
+
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+def reset_password():
+    data = request.json
+    token = data.get('token')
+    new_password = data.get('new_password')
+    
+    print(f"🔐 Reset password request with token: {token}")
+    
+    if not token or not new_password:
+        return jsonify({'error': 'Token and new password are required'}), 400
+    
+    is_valid, password_msg = validate_password(new_password)
+    if not is_valid:
+        return jsonify({'error': password_msg}), 400
+    
+    user = User.query.filter_by(reset_token=token).first()
+    
+    if not user:
+        print(f"❌ Invalid token: {token}")
+        return jsonify({'error': 'Invalid or expired reset token'}), 400
+    
+    if user.reset_expiry < datetime.utcnow():
+        print(f"❌ Token expired for user: {user.email}")
+        return jsonify({'error': 'Reset token has expired. Please request a new one.'}), 400
+    
+    user.password = generate_password_hash(new_password)
+    user.reset_token = None
+    user.reset_expiry = None
+    db.session.commit()
+    
+    print(f"✅ Password reset successfully for: {user.email}")
+    
+    return jsonify({'message': 'Password reset successfully'})
+
+
+@app.route('/api/auth/user/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({
+        'id': user.id,
+        'email': user.email,
+        'full_name': user.full_name,
+        'phone': user.phone,
+        'role': user.role,
+        'is_verified': user.is_verified,
+        'rating': user.rating,
+        'total_jobs': user.total_jobs,
+        'created_at': user.created_at.isoformat(),
+        'service_specialization': user.service_specialization.name if user.service_specialization else None,
+        'service_specialization_id': user.service_specialization_id
+    })
+
+
+@app.route('/api/auth/update-profile/<int:user_id>', methods=['PUT'])
+@limiter.limit("10 per minute")
+def update_profile(user_id):
+    data = request.json
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if 'full_name' in data:
+        user.full_name = data['full_name']
+    if 'phone' in data:
+        user.phone = data['phone']
+    if 'email' in data:
+        if not validate_email(data['email']):
+            return jsonify({'error': 'Invalid email format'}), 400
+        existing = User.query.filter_by(email=data['email']).first()
+        if existing and existing.id != user_id:
+            return jsonify({'error': 'Email already in use'}), 400
+        user.email = data['email']
+    
+    db.session.commit()
+    return jsonify({'message': 'Profile updated successfully', 'user': {
+        'id': user.id, 'full_name': user.full_name, 'phone': user.phone, 'email': user.email
+    }})
+
+
+@app.route('/api/auth/change-password/<int:user_id>', methods=['PUT'])
+@limiter.limit("5 per minute")
+def change_password(user_id):
+    data = request.json
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if not check_password_hash(user.password, data.get('current_password')):
+        return jsonify({'error': 'Current password is incorrect'}), 401
+    
+    is_valid, password_msg = validate_password(data.get('new_password'))
+    if not is_valid:
+        return jsonify({'error': password_msg}), 400
+    
+    user.password = generate_password_hash(data.get('new_password'))
+    db.session.commit()
+    
+    return jsonify({'message': 'Password changed successfully'})
+
+
+@app.route('/api/auth/toggle-online/<int:user_id>', methods=['PUT'])
+@limiter.limit("30 per minute")
+def toggle_online_status(user_id):
+    try:
+        session_user_id = session.get('user_id')
+        
+        print(f"🔍 Toggle online status called - URL user_id: {user_id}, Session user_id: {session_user_id}")
+        
+        if not session_user_id:
+            return jsonify({'error': 'Authentication required. Please log in.'}), 401
+        
+        if session_user_id != user_id:
+            return jsonify({'error': f'You can only change your own status.'}), 403
+        
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        data = request.json
+        is_online = data.get('is_online', False)
+        
+        user.is_online_manual = is_online
+        user.last_seen = datetime.utcnow()
+        db.session.commit()
+        
+        try:
+            socketio.emit('user_status', {'userId': user_id, 'isOnline': is_online})
+        except Exception as e:
+            print(f"Error broadcasting status: {e}")
+        
+        return jsonify({
+            'success': True,
+            'message': f'{user.full_name} is now {"Online" if is_online else "Offline"}',
+            'is_online': is_online
+        })
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error toggling online status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/delete-account', methods=['DELETE'])
+def delete_own_account():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user.role == 'admin':
+        return jsonify({'error': 'Admin accounts cannot be deleted through this endpoint'}), 403
+    
+    ServiceRequest.query.filter_by(user_id=user_id).delete()
+    ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
+    Notification.query.filter_by(user_id=user_id).delete()
+    Message.query.filter((Message.sender_id == user_id) | (Message.receiver_id == user_id)).delete()
+    Comment.query.filter_by(user_id=user_id).delete()
+    CommentReply.query.filter_by(user_id=user_id).delete()
+    
+    db.session.delete(user)
+    db.session.commit()
+    
+    session.clear()
+    
+    return jsonify({'message': 'Account deleted successfully'})
+
+
+# ==================== UPLOAD ROUTES ====================
+
+@app.route('/api/requests/<int:request_id>/notify-no-provider', methods=['POST'])
+@admin_required
+def notify_no_provider(request_id):
+    try:
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        create_notification(
+            service_request.user_id,
+            f'⚠️ We are currently looking for a provider for your {service_request.service.name} request. We will notify you as soon as one is assigned.',
+            'info',
+            '/customer/dashboard'
+        )
+        
+        return jsonify({'message': 'Customer notified successfully'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in notify_no_provider: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
+
+@app.route('/api/upload', methods=['POST'])
+@limiter.limit("50 per hour")
+def upload_file():
+    try:
+        user_id = request.form.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'User ID required'}), 400
+        
+        user = db.session.get(User, int(user_id))
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed'}), 400
+        
+        original_filename = secure_filename(file.filename)
+        ext = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else ''
+        unique_filename = f"{uuid.uuid4().hex}.{ext}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        
+        file.save(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        mime_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+        file_type = get_file_type(original_filename)
+        
+        return jsonify({
+            'message': 'File uploaded successfully',
+            'file': {
+                'filename': unique_filename,
+                'original_name': original_filename,
+                'size': file_size,
+                'type': file_type,
+                'mime_type': mime_type,
+                'path': f'/uploads/{unique_filename}'
+            }
+        })
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error uploading file: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+# ==================== SERVICE ROUTES ====================
+
+@app.route('/api/services', methods=['GET'])
+def get_services():
+    active_only = request.args.get('active_only', 'false').lower() == 'true'
+    if active_only:
+        services = Service.query.filter_by(is_active=True).all()
+    else:
+        services = Service.query.all()
+    return jsonify([{
+        'id': s.id,
+        'name': s.name,
+        'description': s.description,
+        'total_price': s.total_price,
+        'provider_payout': s.provider_payout,
+        'admin_fee': s.admin_fee,
+        'site_fee': s.site_fee,
+        'icon': s.icon,
+        'is_active': s.is_active
+    } for s in services])
+
+
+@app.route('/api/services', methods=['POST'])
+@admin_required
+def create_service():
+    try:
+        data = request.json
+        
+        try:
+            total_price = float(data.get('total_price', 0))
+            if total_price <= 0 or total_price > 10000:
+                return jsonify({'error': 'Price must be between 0 and 10,000'}), 400
+            if math.isnan(total_price) or math.isinf(total_price):
+                return jsonify({'error': 'Invalid price value'}), 400
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Price must be a valid number'}), 400
+        
+        percentages = get_current_percentages()
+        
+        provider_payout = total_price * (percentages.provider_percent / 100)
+        admin_fee = total_price * (percentages.admin_percent / 100)
+        site_fee = total_price * (percentages.site_fee_percent / 100)
+        
+        new_service = Service(
+            name=data.get('name'),
+            description=data.get('description'),
+            total_price=total_price,
+            provider_payout=provider_payout,
+            admin_fee=admin_fee,
+            site_fee=site_fee,
+            icon=data.get('icon', '🔧'),
+            is_active=False
+        )
+        db.session.add(new_service)
+        db.session.commit()
+        
+        socketio.emit('service_created', {
+            'id': new_service.id,
+            'name': new_service.name,
+            'total_price': new_service.total_price,
+            'provider_payout': new_service.provider_payout,
+            'admin_fee': new_service.admin_fee,
+            'site_fee': new_service.site_fee,
+            'icon': new_service.icon,
+            'is_active': new_service.is_active
+        })
+        
+        return jsonify({'message': 'Service created', 'id': new_service.id})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating service: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/services/<int:service_id>/toggle', methods=['PUT'])
+@admin_required
+def toggle_service_active(service_id):
+    service = db.session.get(Service, service_id)
+    if not service:
+        return jsonify({'error': 'Service not found'}), 404
+    
+    service.is_active = not service.is_active
+    db.session.commit()
+    
+    socketio.emit('service_toggled', {
+        'id': service.id,
+        'is_active': service.is_active,
+        'name': service.name
+    })
+    
+    return jsonify({'message': f'Service {"activated" if service.is_active else "deactivated"}', 'is_active': service.is_active})
+
+
+@app.route('/api/services/<int:service_id>', methods=['PUT'])
+@admin_required
+def update_service(service_id):
+    try:
+        service = db.session.get(Service, service_id)
+        if not service:
+            return jsonify({'error': 'Service not found'}), 404
+        
+        data = request.json
+        
+        try:
+            total_price = float(data.get('total_price', service.total_price))
+            if total_price <= 0 or total_price > 10000:
+                return jsonify({'error': 'Price must be between 0 and 10,000'}), 400
+            if math.isnan(total_price) or math.isinf(total_price):
+                return jsonify({'error': 'Invalid price value'}), 400
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Price must be a valid number'}), 400
+        
+        percentages = get_current_percentages()
+        
+        service.total_price = total_price
+        service.provider_payout = total_price * (percentages.provider_percent / 100)
+        service.admin_fee = total_price * (percentages.admin_percent / 100)
+        service.site_fee = total_price * (percentages.site_fee_percent / 100)
+        service.name = data.get('name', service.name)
+        service.description = data.get('description', service.description)
+        service.icon = data.get('icon', service.icon)
+        db.session.commit()
+        
+        socketio.emit('service_updated', {
+            'id': service.id,
+            'name': service.name,
+            'total_price': service.total_price,
+            'provider_payout': service.provider_payout,
+            'admin_fee': service.admin_fee,
+            'site_fee': service.site_fee
+        })
+        
+        return jsonify({'message': 'Service updated'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error updating service: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== QUOTE ROUTES ====================
+
+@app.route('/api/quotes', methods=['POST'])
+@limiter.limit("5 per hour")
+def create_quote():
+    data = request.json
+    new_quote = Quote(
+        full_name=data.get('full_name'),
+        phone=data.get('phone'),
+        email=data.get('email'),
+        service_type=data.get('service_type'),
+        location=data.get('location'),
+        message=data.get('message')
+    )
+    db.session.add(new_quote)
+    db.session.commit()
+    
+    socketio.emit('new_quote', {
+        'id': new_quote.id,
+        'full_name': new_quote.full_name,
+        'service_type': new_quote.service_type,
+        'created_at': new_quote.created_at.isoformat()
+    }, room='role_admin')
+    
+    return jsonify({'message': 'Quote submitted successfully', 'id': new_quote.id})
+
+
+@app.route('/api/quotes', methods=['GET'])
+@admin_required
+def get_quotes():
+    quotes = Quote.query.order_by(Quote.created_at.desc()).all()
+    return jsonify([{
+        'id': q.id,
+        'full_name': q.full_name,
+        'phone': q.phone,
+        'email': q.email,
+        'service_type': q.service_type,
+        'location': q.location,
+        'message': q.message,
+        'status': q.status,
+        'created_at': q.created_at.isoformat()
+    } for q in quotes])
+
+
+@app.route('/api/quotes/<int:quote_id>/status', methods=['PUT'])
+@admin_required
+def update_quote_status(quote_id):
+    quote = db.session.get(Quote, quote_id)
+    if not quote:
+        return jsonify({'error': 'Quote not found'}), 404
+    data = request.json
+    quote.status = data.get('status', quote.status)
+    db.session.commit()
+    
+    socketio.emit('quote_status_updated', {
+        'quote_id': quote_id,
+        'status': quote.status
+    }, room='role_admin')
+    
+    return jsonify({'message': 'Quote status updated'})
+
+
+@app.route('/api/quotes/<int:quote_id>', methods=['DELETE'])
+@admin_required
+def delete_quote(quote_id):
+    quote = db.session.get(Quote, quote_id)
+    if not quote:
+        return jsonify({'error': 'Quote not found'}), 404
+    db.session.delete(quote)
+    db.session.commit()
+    return jsonify({'message': 'Quote deleted'})
+
+
+# ==================== COMMENT ROUTES ====================
+
+@app.route('/api/comments', methods=['GET'])
+def get_comments():
+    try:
+        comments = Comment.query.filter_by(is_approved=True).order_by(Comment.created_at.desc()).limit(100).all()
+        result = []
+        for c in comments:
+            try:
+                replies = CommentReply.query.filter_by(comment_id=c.id).order_by(CommentReply.created_at.asc()).all()
+                reply_list = []
+                for r in replies:
+                    reply_list.append({
+                        'id': r.id,
+                        'user_id': r.user_id,
+                        'user_name': r.user_name or 'User',
+                        'user_role': r.user_role or 'customer',
+                        'message': r.message or '',
+                        'created_at': r.created_at.isoformat() if r.created_at else None
+                    })
+                
+                result.append({
+                    'id': c.id,
+                    'user_id': c.user_id,
+                    'user_name': c.user_name or 'Anonymous',
+                    'user_role': c.user_role or 'customer',
+                    'user_avatar': c.user_avatar or '👤',
+                    'rating': c.rating or 5,
+                    'comment': c.comment or '',
+                    'helpful_count': c.helpful_count or 0,
+                    'created_at': c.created_at.isoformat() if c.created_at else None,
+                    'updated_at': c.updated_at.isoformat() if c.updated_at else None,
+                    'replies': reply_list
+                })
+            except Exception as e:
+                print(f"Error processing comment {c.id}: {str(e)}")
+                continue
+        return jsonify(result)
+    except Exception as e:
+        print(f"Error in get_comments: {str(e)}")
+        return jsonify([]), 200
+    
+
+@app.route('/api/comments', methods=['POST'])
+def create_comment():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        user = db.session.get(User, user_id) if user_id else None
+        
+        if not data.get('comment') or len(data.get('comment').strip()) < 3:
+            return jsonify({'error': 'Comment must be at least 3 characters'}), 400
+        
+        sanitized_comment = bleach.clean(data.get('comment'), tags=['b', 'i', 'em', 'strong', 'a'], attributes={'a': ['href']})
+        
+        new_comment = Comment(
+            user_id=user_id if user else None,
+            user_name=data.get('user_name'),
+            user_role=user.role if user else 'customer',
+            user_avatar=data.get('user_avatar', '👤'),
+            rating=data.get('rating', 5),
+            comment=sanitized_comment,
+            is_approved=True,
+            helpful_count=0
+        )
+        db.session.add(new_comment)
+        db.session.commit()
+        
+        socketio.emit('new_comment', {
+            'id': new_comment.id,
+            'user_name': new_comment.user_name,
+            'rating': new_comment.rating,
+            'comment': new_comment.comment[:100]
+        })
+        
+        return jsonify({'message': 'Comment submitted successfully!', 'comment': {
+            'id': new_comment.id,
+            'user_name': new_comment.user_name,
+            'user_role': new_comment.user_role,
+            'user_avatar': new_comment.user_avatar,
+            'rating': new_comment.rating,
+            'comment': new_comment.comment,
+            'helpful_count': new_comment.helpful_count,
+            'created_at': new_comment.created_at.isoformat()
+        }})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating comment: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/comments/<int:comment_id>', methods=['PUT'])
+def update_comment(comment_id):
+    try:
+        data = request.json
+        comment = db.session.get(Comment, comment_id)
+        
+        if not comment:
+            return jsonify({'error': 'Comment not found'}), 404
+        
+        user_id = session.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        user = db.session.get(User, user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 401
+        
+        if user.role != 'admin':
+            time_since = datetime.utcnow() - comment.created_at
+            if time_since.total_seconds() > 120:
+                return jsonify({'error': 'Edit window expired (2 minutes)'}), 403
+            if comment.user_id != user.id:
+                return jsonify({'error': 'You can only edit your own comments'}), 403
+        
+        if 'comment' in data:
+            comment.comment = bleach.clean(data['comment'], tags=['b', 'i', 'em', 'strong', 'a'], attributes={'a': ['href']})
+        if 'rating' in data:
+            comment.rating = data['rating']
+        comment.updated_at = datetime.utcnow()
+        
+        db.session.commit()
+        
+        socketio.emit('comment_updated', {
+            'id': comment.id,
+            'comment': comment.comment,
+            'rating': comment.rating
+        })
+        
+        return jsonify({'message': 'Comment updated successfully'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error updating comment: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/comments/<int:comment_id>', methods=['DELETE'])
+def delete_comment(comment_id):
+    try:
+        data = request.json
+        comment = db.session.get(Comment, comment_id)
+        
+        if not comment:
+            return jsonify({'error': 'Comment not found'}), 404
+        
+        user_id = session.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        user = db.session.get(User, user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 401
+        
+        if user.role != 'admin':
+            time_since = datetime.utcnow() - comment.created_at
+            if time_since.total_seconds() > 120:
+                return jsonify({'error': 'Delete window expired (2 minutes)'}), 403
+            if comment.user_id != user.id:
+                return jsonify({'error': 'You can only delete your own comments'}), 403
+        
+        CommentReply.query.filter_by(comment_id=comment_id).delete()
+        db.session.delete(comment)
+        db.session.commit()
+        
+        socketio.emit('comment_deleted', {'id': comment_id})
+        
+        return jsonify({'message': 'Comment deleted successfully'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error deleting comment: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/comments/reply', methods=['POST'])
+def create_reply():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        user = db.session.get(User, user_id) if user_id else None
+        
+        if not user:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        new_reply = CommentReply(
+            comment_id=data.get('comment_id'),
+            user_id=user.id,
+            user_name=user.full_name,
+            user_role=user.role,
+            message=bleach.clean(data.get('message'))
+        )
+        db.session.add(new_reply)
+        db.session.commit()
+        
+        socketio.emit('new_reply', {
+            'comment_id': new_reply.comment_id,
+            'user_name': new_reply.user_name,
+            'message': new_reply.message
+        })
+        
+        return jsonify({'message': 'Reply submitted successfully'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating reply: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/comments', methods=['GET'])
+@admin_required
+def get_all_comments():
+    comments = Comment.query.order_by(Comment.created_at.desc()).all()
+    return jsonify([{
+        'id': c.id,
+        'user_id': c.user_id,
+        'user_name': c.user_name,
+        'user_role': c.user_role,
+        'rating': c.rating,
+        'comment': c.comment,
+        'is_approved': c.is_approved,
+        'helpful_count': c.helpful_count,
+        'created_at': c.created_at.isoformat()
+    } for c in comments])
+
+
+@app.route('/api/admin/comments/<int:comment_id>/toggle', methods=['PUT'])
+@admin_required
+def toggle_comment_approval(comment_id):
+    comment = db.session.get(Comment, comment_id)
+    if not comment:
+        return jsonify({'error': 'Comment not found'}), 404
+    comment.is_approved = not comment.is_approved
+    db.session.commit()
+    
+    socketio.emit('comment_toggled', {
+        'id': comment.id,
+        'is_approved': comment.is_approved
+    })
+    
+    return jsonify({'message': f'Comment {"approved" if comment.is_approved else "hidden"}'})
+
+
+@app.route('/api/admin/comments/<int:comment_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_comment(comment_id):
+    comment = db.session.get(Comment, comment_id)
+    if not comment:
+        return jsonify({'error': 'Comment not found'}), 404
+    CommentReply.query.filter_by(comment_id=comment_id).delete()
+    db.session.delete(comment)
+    db.session.commit()
+    
+    socketio.emit('comment_deleted', {'id': comment_id})
+    
+    return jsonify({'message': 'Comment deleted'})
+
+
+# ==================== SERVICE REQUEST ROUTES ====================
+
+@app.route('/api/requests', methods=['POST'])
+def create_request():
+    try:
+        data = request.json
+        
+        service = db.session.get(Service, data.get('service_id'))
+        if not service:
+            return jsonify({'error': 'Service not found'}), 404
+        
+        if not service.is_active:
+            return jsonify({'error': 'Service is currently inactive'}), 400
+        
+        user = db.session.get(User, data.get('user_id'))
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        customer_phone = data.get('customer_phone', user.phone)
+        
+        new_request = ServiceRequest(
+            user_id=data.get('user_id'),
+            service_id=data.get('service_id'),
+            amount=service.total_price,
+            provider_payout=service.provider_payout,
+            admin_fee=service.admin_fee,
+            site_fee=service.site_fee,
+            location_address=data.get('location_address', ''),
+            location_city=data.get('location_city', ''),
+            location_region=data.get('location_region', ''),
+            location_landmark=data.get('location_landmark', ''),
+            customer_phone=customer_phone,
+            status='pending_approval'
+        )
+        db.session.add(new_request)
+        db.session.commit()
+        
+        create_notification(data.get('user_id'), f'📝 Your request for {service.name} has been submitted. Admin will review and assign a provider. You will pay the provider directly after service completion.', 'info', '/customer/dashboard')
+        
+        socketio.emit('new_request', {
+            'id': new_request.id,
+            'customer_name': user.full_name,
+            'service_name': service.name,
+            'amount': service.total_price,
+            'created_at': new_request.created_at.isoformat()
+        }, room='role_admin')
+        
+        socketio.emit('request_created', {
+            'request_id': new_request.id,
+            'service_name': service.name,
+            'status': 'pending_approval'
+        }, room=f"user_{user.id}")
+        
+        return jsonify({'message': 'Request submitted successfully! Admin will review and assign a provider. Payment will be made directly to the provider.', 'request_id': new_request.id, 'amount': service.total_price})
+    
+    except Exception as e:
+        db.session.rollback()
+        print("Error in create_request:", str(e))
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/requests/user/<int:user_id>', methods=['GET'])
+def get_user_requests(user_id):
+    try:
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        requests = ServiceRequest.query.filter_by(user_id=user_id).order_by(ServiceRequest.created_at.desc()).all()
+        result = []
+        for r in requests:
+            try:
+                result.append({
+                    'id': r.id,
+                    'service_name': r.service.name if r.service else 'Unknown',
+                    'amount': r.amount,
+                    'provider_payout': r.provider_payout,
+                    'admin_fee': r.admin_fee,
+                    'site_fee': r.site_fee,
+                    'status': r.status,
+                    'location_address': r.location_address or '',
+                    'location_city': r.location_city or '',
+                    'location_region': r.location_region or '',
+                    'customer_phone': r.customer_phone or '',
+                    'provider_name': r.provider.full_name if r.provider else None,
+                    'provider_phone': r.provider.phone if r.provider else None,
+                    'rating': r.rating,
+                    'customer_confirmed': r.customer_confirmed,
+                    'provider_completed': r.provider_completed,
+                    'created_at': r.created_at.isoformat() if r.created_at else None
+                })
+            except Exception as e:
+                print(f"Error processing request {r.id}: {str(e)}")
+                continue
+        return jsonify(result)
+    except Exception as e:
+        print(f"Error in get_user_requests: {str(e)}")
+        return jsonify([]), 200
+
+
+@app.route('/api/requests/<int:request_id>/approve-assign', methods=['PUT'])
+@admin_required
+def approve_and_assign_request(request_id):
+    try:
+        data = request.json
+        print(f"📝 Approve-assign request for ID: {request_id}")
+        
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.status != 'pending_approval':
+            return jsonify({'error': f'Cannot assign provider. Current status: {service_request.status}. Only pending_approval requests can be assigned.'}), 400
+        
+        provider_id = data.get('provider_id')
+        if not provider_id:
+            return jsonify({'error': 'Provider must be assigned'}), 400
+        
+        provider = db.session.get(User, provider_id)
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+        
+        if provider.role != 'provider':
+            return jsonify({'error': 'User is not a provider'}), 400
+        
+        if not provider.is_verified:
+            return jsonify({'error': 'Provider not verified'}), 400
+        
+        if provider.service_specialization_id != service_request.service_id:
+            service = db.session.get(Service, service_request.service_id)
+            provider_service = db.session.get(Service, provider.service_specialization_id)
+            return jsonify({
+                'error': f'Provider specializes in {provider_service.name if provider_service else "unknown service"}, not {service.name if service else "this service"}. Please select a provider with matching specialization.'
+            }), 400
+        
+        service = db.session.get(Service, service_request.service_id)
+        
+        service_request.provider_id = provider_id
+        service_request.status = 'assigned'
+        service_request.assigned_at = datetime.utcnow()
+        
+        provider.total_jobs = (provider.total_jobs or 0) + 1
+        
+        db.session.commit()
+        print(f"✅ Provider {provider.full_name} assigned to request {request_id}")
+        
+        create_notification(service_request.user_id, f'✅ Provider Assigned! {provider.full_name} will call you shortly for your {service.name} service. You will pay them directly after service completion.', 'success', '/customer/dashboard')
+        create_notification(provider_id, f'🔔 New Job Assigned! You have been assigned to {service.name} for {service_request.user.full_name}. Contact them immediately. Customer will pay you directly.', 'job', '/provider/dashboard')
+        
+        socketio.emit('provider_assigned', {
+            'request_id': request_id,
+            'customer_id': service_request.user_id,
+            'provider_id': provider_id,
+            'service_name': service.name if service else 'Service'
+        })
+        
+        socketio.emit('request_status_changed', {
+            'request_id': request_id,
+            'status': 'assigned',
+            'user_id': service_request.user_id,
+            'provider_id': provider_id
+        })
+        
+        return jsonify({'message': 'Provider assigned successfully! Both parties have been notified.'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error in approve_and_assign_request: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/requests/<int:request_id>/provider-complete', methods=['PUT'])
+def provider_complete_request(request_id):
+    try:
+        print(f"📝 Provider complete request for ID: {request_id}")
+        
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.status != 'assigned' and service_request.status != 'in_progress':
+            return jsonify({'error': f'Cannot complete. Service status: {service_request.status}. Expected: assigned or in_progress'}), 400
+        
+        service_request.provider_completed = True
+        service_request.status = 'completed'
+        service_request.completed_at = datetime.utcnow()
+        db.session.commit()
+        
+        print(f"✅ Provider marked request {request_id} as completed")
+        
+        create_notification(
+            service_request.user_id, 
+            f'✅ Provider has completed your {service_request.service.name} service. Please confirm completion and pay the provider directly.', 
+            'info', 
+            '/customer/dashboard'
+        )
+        
+        socketio.emit('job_completed', {
+            'request_id': request_id,
+            'customer_id': service_request.user_id,
+            'provider_id': service_request.provider_id,
+            'service_name': service_request.service.name
+        })
+        
+        socketio.emit('request_status_changed', {
+            'request_id': request_id,
+            'status': 'completed',
+            'user_id': service_request.user_id,
+            'provider_id': service_request.provider_id
+        })
+        
+        return jsonify({'message': 'Service marked as completed. Awaiting customer confirmation.'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error in provider_complete_request: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/requests/<int:request_id>/confirm', methods=['PUT'])
+def confirm_request_completion(request_id):
+    try:
+        print(f"📝 Confirm completion request for ID: {request_id}")
+        
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        if not service_request.provider_completed:
+            return jsonify({'error': 'Provider has not marked service as completed yet.'}), 400
+        
+        service_request.customer_confirmed = True
+        service_request.status = 'confirmed'
+        db.session.commit()
+        
+        print(f"✅ Customer confirmed completion for request {request_id}")
+        
+        if service_request.provider_id:
+            create_notification(
+                service_request.provider_id, 
+                f'✅ Customer confirmed completion for {service_request.service.name}. Thank you for your service!', 
+                'success', 
+                '/provider/dashboard'
+            )
+            
+            socketio.emit('customer_confirmed', {
+                'request_id': request_id,
+                'provider_id': service_request.provider_id,
+                'service_name': service_request.service.name
+            })
+            
+            socketio.emit('request_status_changed', {
+                'request_id': request_id,
+                'status': 'confirmed',
+                'user_id': service_request.user_id,
+                'provider_id': service_request.provider_id
+            })
+        
+        return jsonify({'message': 'Completion confirmed. Thank you for using Zivre!'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error in confirm_request_completion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/requests/<int:request_id>/rate', methods=['POST'])
+def rate_request(request_id):
+    data = request.json
+    service_request = db.session.get(ServiceRequest, request_id)
+    if not service_request:
+        return jsonify({'error': 'Request not found'}), 404
+    
+    service_request.rating = data.get('rating')
+    db.session.commit()
+    
+    if service_request.provider_id:
+        provider = db.session.get(User, service_request.provider_id)
+        if provider:
+            all_ratings = ServiceRequest.query.filter(
+                ServiceRequest.provider_id == provider.id,
+                ServiceRequest.rating != None
+            ).all()
+            
+            if all_ratings:
+                avg_rating = sum(r.rating for r in all_ratings) / len(all_ratings)
+                provider.rating = round(avg_rating, 1)
+            else:
+                provider.rating = data.get('rating')
+            
+            db.session.commit()
+    
+    create_notification(service_request.user_id, f'Thank you for rating your service experience!', 'info', '/customer/dashboard')
+    
+    return jsonify({'message': 'Rating submitted'})
+
+
+# ==================== JOB/PROVIDER ROUTES ====================
+
+@app.route('/api/jobs/available', methods=['GET'])
+def get_available_jobs():
+    available_jobs = ServiceRequest.query.filter_by(status='pending_approval', provider_id=None).all()
+    return jsonify([{
+        'id': req.id,
+        'service_name': req.service.name,
+        'customer_name': req.user.full_name,
+        'customer_phone': req.customer_phone or req.user.phone,
+        'location_address': req.location_address,
+        'location_city': req.location_city,
+        'location_region': req.location_region,
+        'location_landmark': req.location_landmark,
+        'amount': req.amount,
+        'provider_payout': req.provider_payout
+    } for req in available_jobs])
+
+
+@app.route('/api/jobs/claim', methods=['POST'])
+def claim_job():
+    data = request.json
+    service_request = db.session.get(ServiceRequest, data.get('request_id'))
+    if not service_request:
+        return jsonify({'error': 'Request not found'}), 404
+    
+    if service_request.provider_id:
+        return jsonify({'error': 'Job already claimed'}), 400
+    
+    provider = db.session.get(User, data.get('provider_id'))
+    if not provider or provider.role != 'provider' or not provider.is_verified:
+        return jsonify({'error': 'Invalid or unverified provider'}), 400
+    
+    if provider.service_specialization_id != service_request.service_id:
+        service = db.session.get(Service, service_request.service_id)
+        provider_service = db.session.get(Service, provider.service_specialization_id)
+        return jsonify({
+            'error': f'You specialize in {provider_service.name if provider_service else "unknown service"}, not {service.name if service else "this service"}. You can only claim jobs matching your specialization.'
+        }), 400
+    
+    service_request.provider_id = provider.id
+    service_request.status = 'in_progress'
+    provider.total_jobs = (provider.total_jobs or 0) + 1
+    db.session.commit()
+    
+    create_notification(service_request.user_id, f'✅ Provider {provider.full_name} has started working on your {service_request.service.name} request.', 'success', '/customer/dashboard')
+    create_notification(provider.id, f'🔔 You have claimed a new job: {service_request.service.name} for {service_request.user.full_name}', 'job', '/provider/dashboard')
+    
+    socketio.emit('job_claimed', {
+        'request_id': service_request.id,
+        'provider_id': provider.id,
+        'customer_id': service_request.user_id
+    })
+    
+    socketio.emit('request_status_changed', {
+        'request_id': service_request.id,
+        'status': 'in_progress',
+        'user_id': service_request.user_id,
+        'provider_id': provider.id
+    })
+    
+    return jsonify({'message': 'Job claimed successfully'})
+
+
+@app.route('/api/jobs/provider/<int:provider_id>', methods=['GET'])
+def get_provider_jobs(provider_id):
+    jobs = ServiceRequest.query.filter_by(provider_id=provider_id).order_by(ServiceRequest.created_at.desc()).all()
+    return jsonify([{
+        'id': j.id,
+        'service_name': j.service.name,
+        'customer_name': j.user.full_name,
+        'customer_phone': j.customer_phone or j.user.phone,
+        'location_address': j.location_address,
+        'location_city': j.location_city,
+        'location_region': j.location_region,
+        'location_landmark': j.location_landmark,
+        'status': j.status,
+        'amount': j.amount,
+        'provider_payout': j.provider_payout,
+        'rating': j.rating,
+        'customer_confirmed': j.customer_confirmed,
+        'provider_completed': j.provider_completed,
+        'created_at': j.created_at.isoformat()
+    } for j in jobs])
+
+
+@app.route('/api/jobs/<int:job_id>/status', methods=['PUT'])
+def update_job_status(job_id):
+    data = request.json
+    service_request = db.session.get(ServiceRequest, job_id)
+    if not service_request:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    new_status = data.get('status')
+    if new_status == 'in_progress':
+        service_request.status = 'in_progress'
+        create_notification(service_request.user_id, f'Your {service_request.service.name} service is now in progress.', 'info', '/customer/dashboard')
+        socketio.emit('job_started', {'request_id': job_id, 'customer_id': service_request.user_id})
+        
+        socketio.emit('request_status_changed', {
+            'request_id': job_id,
+            'status': 'in_progress',
+            'user_id': service_request.user_id,
+            'provider_id': service_request.provider_id
+        })
+    elif new_status == 'provider_completed':
+        return provider_complete_request(job_id)
+    else:
+        return jsonify({'error': 'Invalid status'}), 400
+    
+    db.session.commit()
+    return jsonify({'message': f'Job status updated to {new_status}'})
+
+
+# ==================== NOTIFICATION ROUTES ====================
+
+@app.route('/api/notifications/<int:user_id>', methods=['GET'])
+@limiter.exempt
+def get_notifications(user_id):
+    notifications = Notification.query.filter_by(user_id=user_id).order_by(Notification.created_at.desc()).limit(100).all()
+    return jsonify([{
+        'id': n.id,
+        'message': n.message,
+        'type': n.type,
+        'link': n.link,
+        'read': n.read,
+        'created_at': n.created_at.isoformat()
+    } for n in notifications])
+
+
+@app.route('/api/notifications/<int:notification_id>/read', methods=['PUT'])
+def mark_notification_read(notification_id):
+    notification = db.session.get(Notification, notification_id)
+    if notification:
+        notification.read = True
+        db.session.commit()
+    return jsonify({'message': 'Marked as read'})
+
+
+@app.route('/api/notifications/read-all/<int:user_id>', methods=['PUT'])
+def mark_all_notifications_read_route(user_id):
+    count = mark_all_notifications_read(user_id)
+    return jsonify({'message': f'{count} notifications marked as read'})
+
+
+@app.route('/api/notifications/delete-all/<int:user_id>', methods=['DELETE'])
+def delete_all_notifications_route(user_id):
+    count = delete_all_notifications(user_id)
+    return jsonify({'message': f'{count} notifications deleted'})
+
+
+@app.route('/api/notifications/unread-count/<int:user_id>', methods=['GET'])
+@limiter.exempt
+def get_unread_count(user_id):
+    count = Notification.query.filter_by(user_id=user_id, read=False).count()
+    return jsonify({'count': count})
+
+
+@app.route('/api/notifications/<int:notification_id>', methods=['DELETE'])
+def delete_notification(notification_id):
+    notification = db.session.get(Notification, notification_id)
+    if not notification:
+        return jsonify({'error': 'Notification not found'}), 404
+    db.session.delete(notification)
+    db.session.commit()
+    return jsonify({'message': 'Notification deleted'})
+
+
+# ==================== MESSAGING ROUTES ====================
+
+@app.route('/api/messages', methods=['POST'])
+def send_message():
+    data = request.json
+    sender_id = data.get('sender_id')
+    receiver_id = data.get('receiver_id')
+    subject = data.get('subject', '')
+    message_text = data.get('message')
+    reply_to_id = data.get('reply_to_id')
+    attachment_path = data.get('attachment_path')
+    attachment_type = data.get('attachment_type')
+    attachment_name = data.get('attachment_name')
+    
+    if not message_text and not attachment_path:
+        return jsonify({'error': 'Message cannot be empty'}), 400
+    
+    sender = db.session.get(User, sender_id)
+    receiver = db.session.get(User, receiver_id)
+    
+    if not sender or not receiver:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if sender.role == 'customer' and receiver.role == 'customer':
+        return jsonify({'error': 'Customers cannot message other customers'}), 403
+    
+    if sender.role == 'provider' and receiver.role == 'provider':
+        return jsonify({'error': 'Providers cannot message other providers'}), 403
+    
+    if sender.role == 'customer' and receiver.role == 'provider':
+        assigned_job = ServiceRequest.query.filter(
+            ServiceRequest.provider_id == receiver_id, 
+            ServiceRequest.user_id == sender_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed'])
+        ).first()
+        if not assigned_job:
+            return jsonify({'error': 'You can only message providers assigned to your active or completed jobs'}), 403
+    
+    if sender.role == 'provider' and receiver.role == 'customer':
+        assigned_job = ServiceRequest.query.filter(
+            ServiceRequest.provider_id == sender_id, 
+            ServiceRequest.user_id == receiver_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed'])
+        ).first()
+        if not assigned_job:
+            return jsonify({'error': 'You can only message customers assigned to your active or completed jobs'}), 403
+    
+    new_message = Message(
+        sender_id=sender_id,
+        receiver_id=receiver_id,
+        subject=subject,
+        message=bleach.clean(message_text) if message_text else '',
+        reply_to_id=reply_to_id,
+        attachment_path=attachment_path,
+        attachment_type=attachment_type,
+        attachment_name=attachment_name
+    )
+    db.session.add(new_message)
+    db.session.commit()
+    
+    create_notification(receiver_id, f'📩 New message from {sender.full_name}', 'message', '/messages')
+    
+    socketio.emit('new_message', {
+        'id': new_message.id,
+        'sender_id': sender_id,
+        'sender_name': sender.full_name,
+        'receiver_id': receiver_id,
+        'message': new_message.message,
+        'attachment_path': attachment_path,
+        'attachment_type': attachment_type,
+        'attachment_name': attachment_name,
+        'reply_to_id': reply_to_id,
+        'created_at': new_message.created_at.isoformat()
+    }, room=f"user_{receiver_id}")
+    
+    return jsonify({'message': 'Message sent', 'id': new_message.id})
+
+
+@app.route('/api/messages/<int:message_id>', methods=['DELETE'])
+def delete_message(message_id):
+    try:
+        data = request.json
+        user_id = data.get('user_id') if data else None
+        delete_for_everyone = data.get('delete_for_everyone', False)
+        
+        message = db.session.get(Message, message_id)
+        if not message:
+            return jsonify({'error': 'Message not found'}), 404
+        
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 401
+        
+        if delete_for_everyone:
+            time_since = datetime.utcnow() - message.created_at
+            if time_since.total_seconds() > 300:
+                return jsonify({'error': 'Delete for everyone only available within 5 minutes of sending'}), 403
+            if message.sender_id != user_id:
+                return jsonify({'error': 'Only the sender can delete for everyone'}), 403
+            db.session.delete(message)
+        else:
+            if user_id == message.sender_id:
+                message.is_deleted_for_sender = True
+            elif user_id == message.receiver_id:
+                message.is_deleted_for_receiver = True
+            else:
+                return jsonify({'error': 'You can only delete your own messages'}), 403
+        
+        db.session.commit()
+        
+        return jsonify({'message': 'Message deleted successfully'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error deleting message: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/messages/<int:message_id>/edit', methods=['PUT'])
+def edit_message(message_id):
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        new_message_text = data.get('message')
+        
+        if not new_message_text:
+            return jsonify({'error': 'Message cannot be empty'}), 400
+        
+        message = db.session.get(Message, message_id)
+        if not message:
+            return jsonify({'error': 'Message not found'}), 404
+        
+        if message.sender_id != user_id:
+            return jsonify({'error': 'You can only edit your own messages'}), 403
+        
+        time_since = datetime.utcnow() - message.created_at
+        if time_since.total_seconds() > 300:
+            return jsonify({'error': 'Edit window expired (5 minutes)'}), 403
+        
+        old_message = message.message
+        message.message = bleach.clean(new_message_text)
+        message.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        socketio.emit('message_edited', {
+            'message_id': message_id,
+            'new_message': message.message,
+            'old_message': old_message,
+            'edited_at': message.updated_at.isoformat()
+        }, room=f"user_{message.receiver_id}")
+        
+        return jsonify({'message': 'Message edited successfully'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error editing message: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/messages/user/<int:user_id>', methods=['GET'])
+def get_user_messages(user_id):
+    messages = Message.query.filter(
+        ((Message.sender_id == user_id) | (Message.receiver_id == user_id)),
+        Message.is_deleted_for_sender == False,
+        Message.is_deleted_for_receiver == False
+    ).order_by(Message.created_at.desc()).all()
+    
+    return jsonify([{
+        'id': m.id,
+        'sender_id': m.sender_id,
+        'sender_name': m.sender.full_name if m.sender else 'Unknown',
+        'sender_role': m.sender.role if m.sender else 'unknown',
+        'receiver_id': m.receiver_id,
+        'receiver_name': m.receiver.full_name if m.receiver else 'Unknown',
+        'receiver_role': m.receiver.role if m.receiver else 'unknown',
+        'subject': m.subject,
+        'message': m.message,
+        'attachment_path': m.attachment_path,
+        'attachment_type': m.attachment_type,
+        'attachment_name': m.attachment_name,
+        'reply_to_id': m.reply_to_id,
+        'is_read': m.is_read,
+        'is_delivered': m.is_delivered,
+        'created_at': m.created_at.isoformat(),
+        'updated_at': m.updated_at.isoformat() if m.updated_at else None
+    } for m in messages])
+
+
+@app.route('/api/messages/<int:message_id>/read', methods=['PUT'])
+def mark_message_read(message_id):
+    message = db.session.get(Message, message_id)
+    if message:
+        message.is_read = True
+        message.read_at = datetime.utcnow()
+        db.session.commit()
+        
+        socketio.emit('message_read', {
+            'message_id': message_id,
+            'sender_id': message.sender_id
+        }, room=f"user_{message.sender_id}")
+    
+    return jsonify({'message': 'Message marked as read'})
+
+
+@app.route('/api/messages/unread/<int:user_id>', methods=['GET'])
+def get_unread_messages_count(user_id):
+    count = Message.query.filter_by(receiver_id=user_id, is_read=False).count()
+    return jsonify({'count': count})
+
+
+@app.route('/api/messages/conversation/<int:user1>/<int:user2>', methods=['GET'])
+def get_conversation(user1, user2):
+    messages = Message.query.filter(
+        ((Message.sender_id == user1) & (Message.receiver_id == user2)) |
+        ((Message.sender_id == user2) & (Message.receiver_id == user1)),
+        Message.is_deleted_for_sender == False,
+        Message.is_deleted_for_receiver == False
+    ).order_by(Message.created_at.asc()).all()
+    
+    return jsonify([{
+        'id': m.id,
+        'sender_id': m.sender_id,
+        'sender_name': m.sender.full_name if m.sender else 'Unknown',
+        'sender_role': m.sender.role if m.sender else 'unknown',
+        'receiver_id': m.receiver_id,
+        'receiver_name': m.receiver.full_name if m.receiver else 'Unknown',
+        'receiver_role': m.receiver.role if m.receiver else 'unknown',
+        'subject': m.subject,
+        'message': m.message,
+        'attachment_path': m.attachment_path,
+        'attachment_type': m.attachment_type,
+        'attachment_name': m.attachment_name,
+        'reply_to_id': m.reply_to_id,
+        'is_read': m.is_read,
+        'is_delivered': m.is_delivered,
+        'created_at': m.created_at.isoformat(),
+        'updated_at': m.updated_at.isoformat() if m.updated_at else None
+    } for m in messages])
+
+
+# ==================== CONTACTS ROUTE ====================
+
+@app.route('/api/contacts/<int:user_id>', methods=['GET'])
+def get_contacts(user_id):
+    current_user = db.session.get(User, user_id)
+    if not current_user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    contacts = []
+    all_users = User.query.filter(User.id != user_id).all()
+    
+    if current_user.role == 'admin':
+        for u in all_users:
+            contacts.append({
+                'id': u.id, 
+                'full_name': u.full_name, 
+                'role': u.role, 
+                'rating': u.rating, 
+                'total_jobs': u.total_jobs,
+                'email': u.email,
+                'phone': u.phone,
+                'is_verified': u.is_verified,
+                'is_online': u.is_online_manual,
+                'last_seen': u.last_seen.isoformat() if u.last_seen else None,
+                'service_specialization': u.service_specialization.name if u.service_specialization else None
+            })
+    
+    elif current_user.role == 'provider':
+        admin = User.query.filter_by(role='admin').first()
+        if admin and admin.id != user_id:
+            contacts.append({
+                'id': admin.id, 
+                'full_name': admin.full_name, 
+                'role': admin.role,
+                'rating': admin.rating, 
+                'total_jobs': admin.total_jobs,
+                'email': admin.email, 
+                'phone': admin.phone, 
+                'is_verified': admin.is_verified,
+                'is_online': admin.is_online_manual,
+                'last_seen': admin.last_seen.isoformat() if admin.last_seen else None
+            })
+        
+        active_jobs = ServiceRequest.query.filter(
+            ServiceRequest.provider_id == user_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed'])
+        ).all()
+        
+        customer_ids = set()
+        for job in active_jobs:
+            if job.user_id and job.user_id not in customer_ids:
+                customer_ids.add(job.user_id)
+                customer = db.session.get(User, job.user_id)
+                if customer:
+                    contacts.append({
+                        'id': customer.id, 
+                        'full_name': customer.full_name, 
+                        'role': customer.role,
+                        'rating': customer.rating, 
+                        'total_jobs': customer.total_jobs,
+                        'email': customer.email, 
+                        'phone': customer.phone, 
+                        'is_verified': customer.is_verified,
+                        'is_online': customer.is_online_manual,
+                        'last_seen': customer.last_seen.isoformat() if customer.last_seen else None
+                    })
+    
+    elif current_user.role == 'customer':
+        admin = User.query.filter_by(role='admin').first()
+        if admin and admin.id != user_id:
+            contacts.append({
+                'id': admin.id, 
+                'full_name': admin.full_name, 
+                'role': admin.role,
+                'rating': admin.rating, 
+                'total_jobs': admin.total_jobs,
+                'email': admin.email, 
+                'phone': admin.phone, 
+                'is_verified': admin.is_verified,
+                'is_online': admin.is_online_manual,
+                'last_seen': admin.last_seen.isoformat() if admin.last_seen else None
+            })
+        
+        active_requests = ServiceRequest.query.filter(
+            ServiceRequest.user_id == user_id,
+            ServiceRequest.status.in_(['assigned', 'in_progress', 'completed', 'confirmed']),
+            ServiceRequest.provider_id != None
+        ).all()
+        
+        provider_ids = set()
+        for req in active_requests:
+            if req.provider_id and req.provider_id not in provider_ids:
+                provider_ids.add(req.provider_id)
+                provider = db.session.get(User, req.provider_id)
+                if provider:
+                    contacts.append({
+                        'id': provider.id, 
+                        'full_name': provider.full_name, 
+                        'role': provider.role,
+                        'rating': provider.rating, 
+                        'total_jobs': provider.total_jobs,
+                        'email': provider.email, 
+                        'phone': provider.phone, 
+                        'is_verified': provider.is_verified,
+                        'is_online': provider.is_online_manual,
+                        'last_seen': provider.last_seen.isoformat() if provider.last_seen else None,
+                        'service_specialization': provider.service_specialization.name if provider.service_specialization else None
+                    })
+    
+    return jsonify(contacts)
+
+
+# ==================== ADMIN ROUTES ====================
+
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def get_all_users():
+    users = User.query.all()
+    return jsonify([{
+        'id': u.id,
+        'full_name': u.full_name,
+        'email': u.email,
+        'phone': u.phone,
+        'role': u.role,
+        'is_active': u.is_active,
+        'is_verified': u.is_verified,
+        'rating': u.rating,
+        'total_jobs': u.total_jobs,
+        'created_at': u.created_at.isoformat(),
+        'service_specialization': u.service_specialization.name if u.service_specialization else None
+    } for u in users])
+
+
+@app.route('/api/admin/users/<int:user_id>/full-details', methods=['GET'])
+@admin_required
+def get_user_full_details(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user.role == 'customer':
+        requests = ServiceRequest.query.filter_by(user_id=user_id).all()
+        total_spent = sum(r.amount for r in requests)
+        completed_requests = [r for r in requests if r.status == 'confirmed']
+        
+        requests_data = [{
+            'id': r.id,
+            'service_name': r.service.name if r.service else 'Unknown',
+            'amount': r.amount,
+            'status': r.status,
+            'provider_name': r.provider.full_name if r.provider else None,
+            'created_at': r.created_at.isoformat(),
+            'completed_at': r.completed_at.isoformat() if r.completed_at else None
+        } for r in requests]
+        
+        return jsonify({
+            'id': user.id,
+            'full_name': user.full_name,
+            'email': user.email,
+            'phone': user.phone,
+            'role': user.role,
+            'is_active': user.is_active,
+            'is_verified': user.is_verified,
+            'rating': user.rating,
+            'total_jobs': user.total_jobs,
+            'created_at': user.created_at.isoformat(),
+            'last_seen': user.last_seen.isoformat() if user.last_seen else None,
+            'is_online': user.is_online_manual,
+            'total_spent': total_spent,
+            'total_requests': len(requests),
+            'completed_requests_count': len(completed_requests),
+            'service_requests': requests_data
+        })
+    
+    elif user.role == 'provider':
+        jobs = ServiceRequest.query.filter_by(provider_id=user_id).all()
+        total_earned = sum(j.provider_payout for j in jobs if j.status == 'confirmed')
+        completed_jobs = [j for j in jobs if j.status == 'confirmed']
+        
+        jobs_data = [{
+            'id': j.id,
+            'service_name': j.service.name if j.service else 'Unknown',
+            'amount': j.amount,
+            'provider_payout': j.provider_payout,
+            'status': j.status,
+            'customer_name': j.user.full_name if j.user else None,
+            'created_at': j.created_at.isoformat(),
+            'completed_at': j.completed_at.isoformat() if j.completed_at else None,
+            'rating': j.rating
+        } for j in jobs]
+        
+        return jsonify({
+            'id': user.id,
+            'full_name': user.full_name,
+            'email': user.email,
+            'phone': user.phone,
+            'role': user.role,
+            'is_active': user.is_active,
+            'is_verified': user.is_verified,
+            'rating': user.rating,
+            'total_jobs': user.total_jobs,
+            'created_at': user.created_at.isoformat(),
+            'last_seen': user.last_seen.isoformat() if user.last_seen else None,
+            'is_online': user.is_online_manual,
+            'total_earned': total_earned,
+            'total_jobs_count': len(jobs),
+            'completed_jobs_count': len(completed_jobs),
+            'service_specialization': user.service_specialization.name if user.service_specialization else None,
+            'jobs': jobs_data
+        })
+    
+    else:
+        return jsonify({
+            'id': user.id,
+            'full_name': user.full_name,
+            'email': user.email,
+            'phone': user.phone,
+            'role': user.role,
+            'is_active': user.is_active,
+            'is_verified': user.is_verified,
+            'rating': user.rating,
+            'total_jobs': user.total_jobs,
+            'created_at': user.created_at.isoformat(),
+            'last_seen': user.last_seen.isoformat() if user.last_seen else None,
+            'is_online': user.is_online_manual
+        })
+
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@admin_required
+def delete_user(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user.role == 'admin':
+        return jsonify({'error': 'Cannot delete admin user'}), 403
+    
+    ServiceRequest.query.filter_by(user_id=user_id).delete()
+    ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
+    Notification.query.filter_by(user_id=user_id).delete()
+    Message.query.filter((Message.sender_id == user_id) | (Message.receiver_id == user_id)).delete()
+    Comment.query.filter_by(user_id=user_id).delete()
+    CommentReply.query.filter_by(user_id=user_id).delete()
+    
+    db.session.delete(user)
+    db.session.commit()
+    
+    socketio.emit('user_deleted', {'user_id': user_id})
+    
+    return jsonify({'message': 'User deleted successfully'})
+
+
+@app.route('/api/admin/users/<int:user_id>/verify', methods=['PUT'])
+@admin_required
+def verify_provider(user_id):
+    try:
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if user.role != 'provider':
+            return jsonify({'error': 'Only providers can be verified'}), 400
+        
+        user.is_verified = True
+        db.session.commit()
+        
+        try:
+            create_notification(user_id, '✅ Your provider account has been verified! You can now claim jobs.', 'success', '/provider/dashboard')
+        except Exception as e:
+            print(f"Notification error (non-critical): {e}")
+        
+        try:
+            socketio.emit('user_verified', {
+                'user_id': user_id,
+                'is_verified': True
+            })
+            socketio.emit('users_updated', {})
+        except Exception as e:
+            print(f"SocketIO error (non-critical): {e}")
+        
+        return jsonify({'message': 'Provider verified successfully', 'is_verified': True})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"ERROR in verify_provider: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users/<int:user_id>/suspend', methods=['PUT'])
+@admin_required
+def suspend_user(user_id):
+    try:
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if user.role == 'admin':
+            return jsonify({'error': 'Cannot suspend admin users'}), 403
+        
+        user.is_active = not user.is_active
+        db.session.commit()
+        
+        status = 'suspended' if not user.is_active else 'activated'
+        
+        try:
+            create_notification(user_id, f'⚠️ Your account has been {status}.', 'warning', '/')
+        except Exception as e:
+            print(f"Notification error (non-critical): {e}")
+        
+        try:
+            socketio.emit('user_suspended', {
+                'user_id': user_id,
+                'is_active': user.is_active
+            })
+            socketio.emit('users_updated', {})
+        except Exception as e:
+            print(f"SocketIO error (non-critical): {e}")
+        
+        return jsonify({'message': f'User {status} successfully', 'is_active': user.is_active})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"ERROR in suspend_user: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/requests', methods=['GET'])
+@admin_required
+def get_all_requests():
+    requests = ServiceRequest.query.order_by(ServiceRequest.created_at.desc()).all()
+    return jsonify([{
+        'id': r.id,
+        'user_id': r.user_id,
+        'customer_name': r.user.full_name if r.user else 'Unknown',
+        'customer_phone': r.customer_phone or (r.user.phone if r.user else 'Unknown'),
+        'service_name': r.service.name if r.service else 'Unknown',
+        'service_id': r.service_id,
+        'amount': r.amount,
+        'provider_payout': r.provider_payout,
+        'admin_fee': r.admin_fee,
+        'site_fee': r.site_fee,
+        'status': r.status,
+        'location_address': r.location_address,
+        'location_city': r.location_city,
+        'location_region': r.location_region,
+        'location_landmark': r.location_landmark,
+        'provider_name': r.provider.full_name if r.provider else None,
+        'provider_id': r.provider_id,
+        'customer_confirmed': r.customer_confirmed,
+        'provider_completed': r.provider_completed,
+        'created_at': r.created_at.isoformat(),
+        'assigned_at': r.assigned_at.isoformat() if r.assigned_at else None,
+        'completed_at': r.completed_at.isoformat() if r.completed_at else None
+    } for r in requests])
+
+
+@app.route('/api/admin/providers', methods=['GET'])
+@admin_required
+def get_available_providers():
+    service_id = request.args.get('service_id', type=int)
+    
+    if service_id:
+        providers = User.query.filter_by(
+            role='provider', 
+            is_verified=True, 
+            is_active=True,
+            service_specialization_id=service_id
+        ).all()
+    else:
+        providers = User.query.filter_by(role='provider', is_verified=True, is_active=True).all()
+    
+    return jsonify([{
+        'id': p.id,
+        'full_name': p.full_name,
+        'rating': p.rating,
+        'total_jobs': p.total_jobs,
+        'service_specialization': p.service_specialization.name if p.service_specialization else None
+    } for p in providers])
+
+
+@app.route('/api/admin/stats', methods=['GET'])
+@admin_required
+def get_admin_stats():
+    total_users = User.query.count()
+    total_customers = User.query.filter_by(role='customer').count()
+    total_providers = User.query.filter_by(role='provider').count()
+    total_requests = ServiceRequest.query.count()
+    pending_approval = ServiceRequest.query.filter_by(status='pending_approval').count()
+    assigned_requests = ServiceRequest.query.filter_by(status='assigned').count()
+    in_progress = ServiceRequest.query.filter_by(status='in_progress').count()
+    completed_requests = ServiceRequest.query.filter_by(status='completed').count()
+    confirmed_requests = ServiceRequest.query.filter_by(status='confirmed').count()
+    total_quotes = Quote.query.count()
+    active_services = Service.query.filter_by(is_active=True).count()
+    total_comments = Comment.query.count()
+    
+    total_revenue = sum(r.amount for r in ServiceRequest.query.all())
+    total_admin_fees = sum(r.admin_fee for r in ServiceRequest.query.all())
+    total_site_fees = sum(r.site_fee for r in ServiceRequest.query.all())
+    total_provider_payouts = sum(r.provider_payout for r in ServiceRequest.query.filter_by(status='confirmed').all())
+    
+    return jsonify({
+        'total_users': total_users,
+        'total_customers': total_customers,
+        'total_providers': total_providers,
+        'total_requests': total_requests,
+        'pending_approval': pending_approval,
+        'assigned_requests': assigned_requests,
+        'in_progress': in_progress,
+        'completed_requests': completed_requests,
+        'confirmed_requests': confirmed_requests,
+        'total_quotes': total_quotes,
+        'active_services': active_services,
+        'total_comments': total_comments,
+        'total_revenue': total_revenue,
+        'total_admin_fees': total_admin_fees,
+        'total_site_fees': total_site_fees,
+        'total_provider_payouts': total_provider_payouts
+    })
+
+
+# ==================== PAYMENT SETTINGS ROUTES ====================
+
+@app.route('/api/admin/payment-settings', methods=['GET'])
+def get_payment_settings():
+    payment_number = SystemSetting.query.filter_by(key='payment_number').first()
+    momopay_number = SystemSetting.query.filter_by(key='momopay_number').first()
+    support_number = SystemSetting.query.filter_by(key='support_number').first()
+    whatsapp_number = SystemSetting.query.filter_by(key='whatsapp_number').first()
+    
+    return jsonify({
+        'payment_number': payment_number.value if payment_number else '024 000 0000',
+        'momopay_number': momopay_number.value if momopay_number else '024 000 0000',
+        'support_number': support_number.value if support_number else '050 000 0000',
+        'whatsapp_number': whatsapp_number.value if whatsapp_number else '233500000000'
+    })
+
+
+@app.route('/api/admin/payment-settings', methods=['PUT'])
+@admin_required
+def update_payment_settings():
+    data = request.json
+    
+    payment_number = SystemSetting.query.filter_by(key='payment_number').first()
+    if payment_number:
+        payment_number.value = data.get('payment_number', payment_number.value)
+    else:
+        payment_number = SystemSetting(key='payment_number', value=data.get('payment_number', '024 000 0000'))
+        db.session.add(payment_number)
+    
+    momopay_number = SystemSetting.query.filter_by(key='momopay_number').first()
+    if momopay_number:
+        momopay_number.value = data.get('momopay_number', momopay_number.value)
+    else:
+        momopay_number = SystemSetting(key='momopay_number', value=data.get('momopay_number', '024 000 0000'))
+        db.session.add(momopay_number)
+    
+    support_number = SystemSetting.query.filter_by(key='support_number').first()
+    if support_number:
+        support_number.value = data.get('support_number', support_number.value)
+    else:
+        support_number = SystemSetting(key='support_number', value=data.get('support_number', '050 000 0000'))
+        db.session.add(support_number)
+    
+    whatsapp_number = SystemSetting.query.filter_by(key='whatsapp_number').first()
+    if whatsapp_number:
+        whatsapp_number.value = data.get('whatsapp_number', whatsapp_number.value)
+    else:
+        whatsapp_number = SystemSetting(key='whatsapp_number', value=data.get('whatsapp_number', '233500000000'))
+        db.session.add(whatsapp_number)
+    
+    db.session.commit()
+    
+    socketio.emit('payment_settings_updated', {
+        'payment_number': payment_number.value,
+        'momopay_number': momopay_number.value,
+        'support_number': support_number.value,
+        'whatsapp_number': whatsapp_number.value
+    })
+    
+    return jsonify({'message': 'Payment settings updated successfully'})
+
+
+
+
+# ==================== SESSION KEEP ALIVE ====================
+
+@app.route('/api/auth/ping', methods=['GET'])
+def ping():
+    """Simple endpoint to keep session alive and prevent idle logout"""
+    user_id = session.get('user_id')
+    if user_id:
+        # Refresh the session
+        session.permanent = True
+        return jsonify({'message': 'session active', 'user_id': user_id})
+    return jsonify({'message': 'no session'}), 401
+# ==================== INITIAL DATA ====================
+
+def init_db():
+    db.create_all()
+    
+    if not PercentageSetting.query.first():
+        default_percentages = PercentageSetting(
+            provider_percent=60.0,
+            admin_percent=25.0,
+            site_fee_percent=15.0
+        )
+        db.session.add(default_percentages)
+    
+    try:
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)",
+            "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_user_id ON service_requests(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_provider_id ON service_requests(provider_id)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_status ON service_requests(status)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_created_at ON service_requests(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read)",
+            "CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_receiver_id ON messages(receiver_id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_comments_created_at ON comments(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_comments_is_approved ON comments(is_approved)",
+        ]
+        
+        for index_sql in indexes:
+            try:
+                db.session.execute(text(index_sql))
+            except Exception as e:
+                print(f"⚠️ Index creation warning: {e}")
+        
+        db.session.commit()
+        print("✅ Database indexes created successfully")
+    except Exception as e:
+        print(f"⚠️ Index creation warning: {e}")
+    
+    # Only run SQLite commands if we're using SQLite (not PostgreSQL)
+if 'sqlite' in str(db.engine.url):
+    try:
+        db.session.execute(text('PRAGMA journal_mode=WAL'))
+        db.session.commit()
+        print("✅ WAL mode enabled")
+    except Exception as e:
+        print(f"⚠️ WAL mode warning: {e}")
+    
+    default_services = [
+        ('HVAC Systems', 'Heating, ventilation, and air conditioning maintenance and repair', 500, '❄️'),
+        ('Electrical', 'Complete electrical installations, repairs, and safety checks', 400, '⚡'),
+        ('Plumbing', 'Pipe installations, leak repairs, and drainage solutions', 350, '💧'),
+        ('Fire Safety', 'Fire alarm systems, extinguishers, and safety equipment', 600, '🔥'),
+        ('Cleaning', 'Professional cleaning for homes and businesses across Ghana', 250, '🧹'),
+        ('Security', 'CCTV, access control, and security systems monitoring', 550, '🔒'),
+        ('Waste Management', 'Eco-friendly waste disposal and recycling solutions', 300, '🗑️'),
+        ('Reception', 'Front desk and reception management services', 450, '📋'),
+        ('Industry Services', 'Industrial facility maintenance and operations support', 700, '🏭'),
+        ('Healthcare', 'Medical facility cleaning and specialized maintenance', 650, '🏥'),
+        ('Poultry & Agri', 'Agricultural and poultry farm facility management', 500, '🐔'),
+        ('Hospitality', 'Hotel and restaurant facility solutions', 550, '🏨'),
+        ('Wellness', 'Spa, gym, and wellness center maintenance', 480, '🧘')
+    ]
+    
+    percentages = get_current_percentages()
+    created_services = []
+    
+    for name, desc, price, icon in default_services:
+        existing = Service.query.filter_by(name=name).first()
+        if not existing:
+            provider_payout = price * (percentages.provider_percent / 100)
+            admin_fee = price * (percentages.admin_percent / 100)
+            site_fee = price * (percentages.site_fee_percent / 100)
+            
+            service = Service(
+                name=name, 
+                description=desc, 
+                total_price=price,
+                provider_payout=provider_payout,
+                admin_fee=admin_fee,
+                site_fee=site_fee,
+                icon=icon, 
+                is_active=False
+            )
+            db.session.add(service)
+            created_services.append(service)
+    
+    admin = User.query.filter_by(email='admin@zivre.com').first()
+    if not admin:
+        admin = User(
+            email='admin@zivre.com',
+            password=generate_password_hash('Admin123!'),
+            full_name='Admin User',
+            phone='+233000000000',
+            role='admin',
+            is_verified=True
+        )
+        db.session.add(admin)
+    
+    hvac_service = Service.query.filter_by(name='HVAC Systems').first()
+    
+    sample_provider = User.query.filter_by(email='provider@test.com').first()
+    if not sample_provider:
+        sample_provider = User(
+            email='provider@test.com',
+            password=generate_password_hash('Provider123!'),
+            full_name='Test Provider',
+            phone='+233500000000',
+            role='provider',
+            is_verified=True,
+            is_active=True,
+            service_specialization_id=hvac_service.id if hvac_service else None
+        )
+        db.session.add(sample_provider)
+    else:
+        if hvac_service:
+            sample_provider.service_specialization_id = hvac_service.id
+            db.session.add(sample_provider)
+    
+    payment_number = SystemSetting.query.filter_by(key='payment_number').first()
+    if not payment_number:
+        payment_number = SystemSetting(key='payment_number', value='024 000 0000')
+        db.session.add(payment_number)
+    
+    momopay_number = SystemSetting.query.filter_by(key='momopay_number').first()
+    if not momopay_number:
+        momopay_number = SystemSetting(key='momopay_number', value='024 000 0000')
+        db.session.add(momopay_number)
+    
+    support_number = SystemSetting.query.filter_by(key='support_number').first()
+    if not support_number:
+        support_number = SystemSetting(key='support_number', value='050 000 0000')
+        db.session.add(support_number)
+    
+    whatsapp_number = SystemSetting.query.filter_by(key='whatsapp_number').first()
+    if not whatsapp_number:
+        whatsapp_number = SystemSetting(key='whatsapp_number', value='233500000000')
+        db.session.add(whatsapp_number)
+
+    db.session.commit()
+    print("✅ Database initialized successfully!")
+
+
+with app.app_context():
+    init_db()
+
+# ==================== RUN THE APP ====================
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
