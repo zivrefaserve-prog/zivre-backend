@@ -48,25 +48,18 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Database configuration
-# Database configuration - automatically handles SQLite locally and PostgreSQL on Render
-# Database configuration
-# Database configuration - automatically handles SQLite locally and PostgreSQL on Render
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if DATABASE_URL:
-    # We are on Render.com - use PostgreSQL
     app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-    # Fix for Neon.tech (add SSL if needed)
     if 'neon.tech' in DATABASE_URL and 'sslmode' not in DATABASE_URL:
         if '?' in DATABASE_URL:
             app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL + '&sslmode=require'
         else:
             app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL + '?sslmode=require'
 else:
-    # We are on your computer - use SQLite
     app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(BASE_DIR, "zivre.db")}'
            
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 
 db = SQLAlchemy(app)
 
@@ -75,13 +68,12 @@ socketio = SocketIO(app,
     cors_allowed_origins="*", 
     ping_timeout=60, 
     ping_interval=25, 
-    async_mode='gevent',  # ← CHANGED TO gevent
+    async_mode='gevent',
     allow_upgrades=True,
     http_compression=False
 )
 
 # Configure CORS properly
-# Get allowed websites from environment variable
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://zivre-frontend.vercel.app').split(',')
 
 CORS(app, 
@@ -111,11 +103,9 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Add after request handler to ensure session is saved
 @app.after_request
 def after_request(response):
     origin = request.headers.get('Origin')
-    # Only allow your Vercel frontend
     if origin == 'https://zivre-frontend.vercel.app':
         response.headers.add('Access-Control-Allow-Origin', origin)
     response.headers.add('Access-Control-Allow-Credentials', 'true')
@@ -148,7 +138,6 @@ class User(db.Model):
     
     service_specialization = db.relationship('Service', foreign_keys=[service_specialization_id])
 
-
 class Service(db.Model):
     __tablename__ = 'services'
     id = db.Column(db.Integer, primary_key=True)
@@ -162,7 +151,6 @@ class Service(db.Model):
     is_active = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-
 class Quote(db.Model):
     __tablename__ = 'quotes'
     id = db.Column(db.Integer, primary_key=True)
@@ -174,7 +162,6 @@ class Quote(db.Model):
     message = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), default='pending')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
 
 class ServiceRequest(db.Model):
     __tablename__ = 'service_requests'
@@ -203,7 +190,6 @@ class ServiceRequest(db.Model):
     service = db.relationship('Service')
     provider = db.relationship('User', foreign_keys=[provider_id])
 
-
 class Notification(db.Model):
     __tablename__ = 'notifications'
     id = db.Column(db.Integer, primary_key=True)
@@ -213,7 +199,6 @@ class Notification(db.Model):
     link = db.Column(db.String(200), nullable=True)
     read = db.Column(db.Boolean, default=False, index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-
 
 class Message(db.Model):
     __tablename__ = 'messages'
@@ -239,7 +224,6 @@ class Message(db.Model):
     receiver = db.relationship('User', foreign_keys=[receiver_id])
     reply_to = db.relationship('Message', remote_side=[id], backref='replies')
 
-
 class Comment(db.Model):
     __tablename__ = 'comments'
     id = db.Column(db.Integer, primary_key=True)
@@ -257,7 +241,6 @@ class Comment(db.Model):
     
     user = db.relationship('User', foreign_keys=[user_id])
 
-
 class CommentReply(db.Model):
     __tablename__ = 'comment_replies'
     id = db.Column(db.Integer, primary_key=True)
@@ -271,16 +254,12 @@ class CommentReply(db.Model):
     comment = db.relationship('Comment', foreign_keys=[comment_id])
     user = db.relationship('User', foreign_keys=[user_id])
 
-
 class SystemSetting(db.Model):
     __tablename__ = 'system_settings'
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(100), unique=True, nullable=False)
     value = db.Column(db.String(500), nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-# ==================== PERCENTAGE SETTINGS MODEL ====================
 
 class PercentageSetting(db.Model):
     __tablename__ = 'percentage_settings'
@@ -297,7 +276,6 @@ class PercentageSetting(db.Model):
     def is_valid(self):
         total = self.get_total()
         return abs(total - 100.0) < 0.01
-
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -389,7 +367,6 @@ def get_current_percentages():
         db.session.commit()
     return setting
 
-
 # ==================== EMAIL HELPER FUNCTION ====================
 
 def send_reset_email(user_email, user_name, reset_token):
@@ -445,7 +422,6 @@ def send_reset_email(user_email, user_name, reset_token):
     except Exception as e:
         print(f"❌ Email error: {str(e)}")
         return True
-
 
 # ==================== WEBSOCKET EVENTS ====================
 
@@ -563,7 +539,6 @@ def handle_send_message(data):
     
     create_notification(receiver_id, f'New message from {sender.full_name}', 'message', '/messages')
 
-
 @socketio.on('typing')
 def handle_typing(data):
     sender_id = int(request.args.get('userId'))
@@ -609,7 +584,6 @@ def handle_mark_delivered(data):
             'sender_id': sender_id
         }, room=f"user_{sender_id}")
 
-
 # ==================== PERCENTAGE SETTINGS ROUTES ====================
 
 @app.route('/api/settings/percentages', methods=['GET'])
@@ -624,7 +598,6 @@ def get_percentages():
         'is_valid': setting.is_valid(),
         'updated_at': setting.updated_at.isoformat() if setting.updated_at else None
     })
-
 
 @app.route('/api/admin/settings/percentages', methods=['PUT'])
 @admin_required
@@ -669,7 +642,6 @@ def update_percentages():
             'total': total
         }
     })
-
 
 # ==================== AUTH ROUTES ====================
 
@@ -723,7 +695,6 @@ def signup():
         }
     })
 
-
 @app.route('/api/auth/login', methods=['POST'])
 @limiter.limit("10 per minute")
 def login():
@@ -758,7 +729,6 @@ def login():
             'service_specialization_id': user.service_specialization_id
         }
     })
-
 
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
@@ -795,7 +765,6 @@ def forgot_password():
     
     return jsonify({'message': 'Password reset link has been sent to your email address.'})
 
-
 @app.route('/api/auth/reset-password', methods=['POST'])
 def reset_password():
     data = request.json
@@ -830,7 +799,6 @@ def reset_password():
     
     return jsonify({'message': 'Password reset successfully'})
 
-
 @app.route('/api/auth/user/<int:user_id>', methods=['GET'])
 def get_user(user_id):
     user = db.session.get(User, user_id)
@@ -849,7 +817,6 @@ def get_user(user_id):
         'service_specialization': user.service_specialization.name if user.service_specialization else None,
         'service_specialization_id': user.service_specialization_id
     })
-
 
 @app.route('/api/auth/update-profile/<int:user_id>', methods=['PUT'])
 @limiter.limit("10 per minute")
@@ -876,7 +843,6 @@ def update_profile(user_id):
         'id': user.id, 'full_name': user.full_name, 'phone': user.phone, 'email': user.email
     }})
 
-
 @app.route('/api/auth/change-password/<int:user_id>', methods=['PUT'])
 @limiter.limit("5 per minute")
 def change_password(user_id):
@@ -896,7 +862,6 @@ def change_password(user_id):
     db.session.commit()
     
     return jsonify({'message': 'Password changed successfully'})
-
 
 @app.route('/api/auth/toggle-online/<int:user_id>', methods=['PUT'])
 @limiter.limit("30 per minute")
@@ -965,7 +930,6 @@ def delete_own_account():
     
     return jsonify({'message': 'Account deleted successfully'})
 
-
 # ==================== UPLOAD ROUTES ====================
 
 @app.route('/api/requests/<int:request_id>/notify-no-provider', methods=['POST'])
@@ -989,7 +953,6 @@ def notify_no_provider(request_id):
         db.session.rollback()
         print(f"Error in notify_no_provider: {str(e)}")
         return jsonify({'error': str(e)}), 500
-    
 
 @app.route('/api/upload', methods=['POST'])
 @limiter.limit("50 per hour")
@@ -1041,11 +1004,9 @@ def upload_file():
         print(f"Error uploading file: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
 
 # ==================== SERVICE ROUTES ====================
 
@@ -1067,7 +1028,6 @@ def get_services():
         'icon': s.icon,
         'is_active': s.is_active
     } for s in services])
-
 
 @app.route('/api/services', methods=['POST'])
 @admin_required
@@ -1120,7 +1080,6 @@ def create_service():
         print(f"Error creating service: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/services/<int:service_id>/toggle', methods=['PUT'])
 @admin_required
 def toggle_service_active(service_id):
@@ -1138,7 +1097,6 @@ def toggle_service_active(service_id):
     })
     
     return jsonify({'message': f'Service {"activated" if service.is_active else "deactivated"}', 'is_active': service.is_active})
-
 
 @app.route('/api/services/<int:service_id>', methods=['PUT'])
 @admin_required
@@ -1185,7 +1143,6 @@ def update_service(service_id):
         print(f"Error updating service: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 # ==================== QUOTE ROUTES ====================
 
 @app.route('/api/quotes', methods=['POST'])
@@ -1212,7 +1169,6 @@ def create_quote():
     
     return jsonify({'message': 'Quote submitted successfully', 'id': new_quote.id})
 
-
 @app.route('/api/quotes', methods=['GET'])
 @admin_required
 def get_quotes():
@@ -1228,7 +1184,6 @@ def get_quotes():
         'status': q.status,
         'created_at': q.created_at.isoformat()
     } for q in quotes])
-
 
 @app.route('/api/quotes/<int:quote_id>/status', methods=['PUT'])
 @admin_required
@@ -1247,7 +1202,6 @@ def update_quote_status(quote_id):
     
     return jsonify({'message': 'Quote status updated'})
 
-
 @app.route('/api/quotes/<int:quote_id>', methods=['DELETE'])
 @admin_required
 def delete_quote(quote_id):
@@ -1257,7 +1211,6 @@ def delete_quote(quote_id):
     db.session.delete(quote)
     db.session.commit()
     return jsonify({'message': 'Quote deleted'})
-
 
 # ==================== COMMENT ROUTES ====================
 
@@ -1300,7 +1253,6 @@ def get_comments():
     except Exception as e:
         print(f"Error in get_comments: {str(e)}")
         return jsonify([]), 200
-    
 
 @app.route('/api/comments', methods=['POST'])
 def create_comment():
@@ -1349,7 +1301,6 @@ def create_comment():
         print(f"Error creating comment: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/comments/<int:comment_id>', methods=['PUT'])
 def update_comment(comment_id):
     try:
@@ -1396,7 +1347,6 @@ def update_comment(comment_id):
         print(f"Error updating comment: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/comments/<int:comment_id>', methods=['DELETE'])
 def delete_comment(comment_id):
     try:
@@ -1435,7 +1385,6 @@ def delete_comment(comment_id):
         print(f"Error deleting comment: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/comments/reply', methods=['POST'])
 def create_reply():
     try:
@@ -1468,7 +1417,6 @@ def create_reply():
         print(f"Error creating reply: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/admin/comments', methods=['GET'])
 @admin_required
 def get_all_comments():
@@ -1484,7 +1432,6 @@ def get_all_comments():
         'helpful_count': c.helpful_count,
         'created_at': c.created_at.isoformat()
     } for c in comments])
-
 
 @app.route('/api/admin/comments/<int:comment_id>/toggle', methods=['PUT'])
 @admin_required
@@ -1502,7 +1449,6 @@ def toggle_comment_approval(comment_id):
     
     return jsonify({'message': f'Comment {"approved" if comment.is_approved else "hidden"}'})
 
-
 @app.route('/api/admin/comments/<int:comment_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_comment(comment_id):
@@ -1516,7 +1462,6 @@ def admin_delete_comment(comment_id):
     socketio.emit('comment_deleted', {'id': comment_id})
     
     return jsonify({'message': 'Comment deleted'})
-
 
 # ==================== SERVICE REQUEST ROUTES ====================
 
@@ -1578,7 +1523,6 @@ def create_request():
         print("Error in create_request:", str(e))
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/requests/user/<int:user_id>', methods=['GET'])
 def get_user_requests(user_id):
     try:
@@ -1616,7 +1560,6 @@ def get_user_requests(user_id):
     except Exception as e:
         print(f"Error in get_user_requests: {str(e)}")
         return jsonify([]), 200
-
 
 @app.route('/api/requests/<int:request_id>/approve-assign', methods=['PUT'])
 @admin_required
@@ -1688,7 +1631,6 @@ def approve_and_assign_request(request_id):
         print(f"❌ Error in approve_and_assign_request: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/requests/<int:request_id>/provider-complete', methods=['PUT'])
 def provider_complete_request(request_id):
     try:
@@ -1736,7 +1678,6 @@ def provider_complete_request(request_id):
         print(f"❌ Error in provider_complete_request: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/requests/<int:request_id>/confirm', methods=['PUT'])
 def confirm_request_completion(request_id):
     try:
@@ -1783,7 +1724,6 @@ def confirm_request_completion(request_id):
         print(f"❌ Error in confirm_request_completion: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/requests/<int:request_id>/rate', methods=['POST'])
 def rate_request(request_id):
     data = request.json
@@ -1814,12 +1754,31 @@ def rate_request(request_id):
     
     return jsonify({'message': 'Rating submitted'})
 
-
 # ==================== JOB/PROVIDER ROUTES ====================
 
 @app.route('/api/jobs/available', methods=['GET'])
 def get_available_jobs():
-    available_jobs = ServiceRequest.query.filter_by(status='pending_approval', provider_id=None).all()
+    # Get the logged-in provider from session
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    
+    provider = db.session.get(User, user_id)
+    if not provider or provider.role != 'provider':
+        return jsonify({'error': 'Provider access required'}), 403
+    
+    # UNVERIFIED providers see NO jobs
+    if not provider.is_verified:
+        return jsonify([])
+    
+    # Verified providers ONLY see jobs matching their specialization
+    # AND jobs that are pending approval and not assigned to anyone
+    available_jobs = ServiceRequest.query.filter(
+        ServiceRequest.status == 'pending_approval',
+        ServiceRequest.provider_id == None,
+        ServiceRequest.service_id == provider.service_specialization_id
+    ).all()
+    
     return jsonify([{
         'id': req.id,
         'service_name': req.service.name,
@@ -1832,7 +1791,6 @@ def get_available_jobs():
         'amount': req.amount,
         'provider_payout': req.provider_payout
     } for req in available_jobs])
-
 
 @app.route('/api/jobs/claim', methods=['POST'])
 def claim_job():
@@ -1878,7 +1836,6 @@ def claim_job():
     
     return jsonify({'message': 'Job claimed successfully'})
 
-
 @app.route('/api/jobs/provider/<int:provider_id>', methods=['GET'])
 def get_provider_jobs(provider_id):
     jobs = ServiceRequest.query.filter_by(provider_id=provider_id).order_by(ServiceRequest.created_at.desc()).all()
@@ -1899,7 +1856,6 @@ def get_provider_jobs(provider_id):
         'provider_completed': j.provider_completed,
         'created_at': j.created_at.isoformat()
     } for j in jobs])
-
 
 @app.route('/api/jobs/<int:job_id>/status', methods=['PUT'])
 def update_job_status(job_id):
@@ -1928,7 +1884,6 @@ def update_job_status(job_id):
     db.session.commit()
     return jsonify({'message': f'Job status updated to {new_status}'})
 
-
 # ==================== NOTIFICATION ROUTES ====================
 
 @app.route('/api/notifications/<int:user_id>', methods=['GET'])
@@ -1944,7 +1899,6 @@ def get_notifications(user_id):
         'created_at': n.created_at.isoformat()
     } for n in notifications])
 
-
 @app.route('/api/notifications/<int:notification_id>/read', methods=['PUT'])
 def mark_notification_read(notification_id):
     notification = db.session.get(Notification, notification_id)
@@ -1953,25 +1907,21 @@ def mark_notification_read(notification_id):
         db.session.commit()
     return jsonify({'message': 'Marked as read'})
 
-
 @app.route('/api/notifications/read-all/<int:user_id>', methods=['PUT'])
 def mark_all_notifications_read_route(user_id):
     count = mark_all_notifications_read(user_id)
     return jsonify({'message': f'{count} notifications marked as read'})
-
 
 @app.route('/api/notifications/delete-all/<int:user_id>', methods=['DELETE'])
 def delete_all_notifications_route(user_id):
     count = delete_all_notifications(user_id)
     return jsonify({'message': f'{count} notifications deleted'})
 
-
 @app.route('/api/notifications/unread-count/<int:user_id>', methods=['GET'])
 @limiter.exempt
 def get_unread_count(user_id):
     count = Notification.query.filter_by(user_id=user_id, read=False).count()
     return jsonify({'count': count})
-
 
 @app.route('/api/notifications/<int:notification_id>', methods=['DELETE'])
 def delete_notification(notification_id):
@@ -1981,7 +1931,6 @@ def delete_notification(notification_id):
     db.session.delete(notification)
     db.session.commit()
     return jsonify({'message': 'Notification deleted'})
-
 
 # ==================== MESSAGING ROUTES ====================
 
@@ -2060,7 +2009,6 @@ def send_message():
     
     return jsonify({'message': 'Message sent', 'id': new_message.id})
 
-
 @app.route('/api/messages/<int:message_id>', methods=['DELETE'])
 def delete_message(message_id):
     try:
@@ -2098,7 +2046,6 @@ def delete_message(message_id):
         db.session.rollback()
         print(f"Error deleting message: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/messages/<int:message_id>/edit', methods=['PUT'])
 def edit_message(message_id):
@@ -2139,7 +2086,6 @@ def edit_message(message_id):
         print(f"Error editing message: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/messages/user/<int:user_id>', methods=['GET'])
 def get_user_messages(user_id):
     messages = Message.query.filter(
@@ -2168,7 +2114,6 @@ def get_user_messages(user_id):
         'updated_at': m.updated_at.isoformat() if m.updated_at else None
     } for m in messages])
 
-
 @app.route('/api/messages/<int:message_id>/read', methods=['PUT'])
 def mark_message_read(message_id):
     message = db.session.get(Message, message_id)
@@ -2184,12 +2129,10 @@ def mark_message_read(message_id):
     
     return jsonify({'message': 'Message marked as read'})
 
-
 @app.route('/api/messages/unread/<int:user_id>', methods=['GET'])
 def get_unread_messages_count(user_id):
     count = Message.query.filter_by(receiver_id=user_id, is_read=False).count()
     return jsonify({'count': count})
-
 
 @app.route('/api/messages/conversation/<int:user1>/<int:user2>', methods=['GET'])
 def get_conversation(user1, user2):
@@ -2219,7 +2162,6 @@ def get_conversation(user1, user2):
         'created_at': m.created_at.isoformat(),
         'updated_at': m.updated_at.isoformat() if m.updated_at else None
     } for m in messages])
-
 
 # ==================== CONTACTS ROUTE ====================
 
@@ -2332,7 +2274,6 @@ def get_contacts(user_id):
     
     return jsonify(contacts)
 
-
 # ==================== ADMIN ROUTES ====================
 
 @app.route('/api/admin/users', methods=['GET'])
@@ -2352,7 +2293,6 @@ def get_all_users():
         'created_at': u.created_at.isoformat(),
         'service_specialization': u.service_specialization.name if u.service_specialization else None
     } for u in users])
-
 
 @app.route('/api/admin/users/<int:user_id>/full-details', methods=['GET'])
 @admin_required
@@ -2448,7 +2388,6 @@ def get_user_full_details(user_id):
             'is_online': user.is_online_manual
         })
 
-
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
 @admin_required
 def delete_user(user_id):
@@ -2472,7 +2411,6 @@ def delete_user(user_id):
     socketio.emit('user_deleted', {'user_id': user_id})
     
     return jsonify({'message': 'User deleted successfully'})
-
 
 @app.route('/api/admin/users/<int:user_id>/verify', methods=['PUT'])
 @admin_required
@@ -2546,7 +2484,6 @@ def suspend_user(user_id):
         print(f"ERROR in suspend_user: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/admin/requests', methods=['GET'])
 @admin_required
 def get_all_requests():
@@ -2576,7 +2513,6 @@ def get_all_requests():
         'completed_at': r.completed_at.isoformat() if r.completed_at else None
     } for r in requests])
 
-
 @app.route('/api/admin/providers', methods=['GET'])
 @admin_required
 def get_available_providers():
@@ -2599,7 +2535,6 @@ def get_available_providers():
         'total_jobs': p.total_jobs,
         'service_specialization': p.service_specialization.name if p.service_specialization else None
     } for p in providers])
-
 
 @app.route('/api/admin/stats', methods=['GET'])
 @admin_required
@@ -2641,7 +2576,6 @@ def get_admin_stats():
         'total_provider_payouts': total_provider_payouts
     })
 
-
 # ==================== PAYMENT SETTINGS ROUTES ====================
 
 @app.route('/api/admin/payment-settings', methods=['GET'])
@@ -2657,7 +2591,6 @@ def get_payment_settings():
         'support_number': support_number.value if support_number else '050 000 0000',
         'whatsapp_number': whatsapp_number.value if whatsapp_number else '233500000000'
     })
-
 
 @app.route('/api/admin/payment-settings', methods=['PUT'])
 @admin_required
@@ -2703,20 +2636,16 @@ def update_payment_settings():
     
     return jsonify({'message': 'Payment settings updated successfully'})
 
-
-
-
 # ==================== SESSION KEEP ALIVE ====================
 
 @app.route('/api/auth/ping', methods=['GET'])
 def ping():
-    """Simple endpoint to keep session alive and prevent idle logout"""
     user_id = session.get('user_id')
     if user_id:
-        # Refresh the session
         session.permanent = True
         return jsonify({'message': 'session active', 'user_id': user_id})
     return jsonify({'message': 'no session'}), 401
+
 # ==================== INITIAL DATA ====================
 
 def init_db():
@@ -2759,7 +2688,6 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Index creation warning: {e}")
     
-    # Only run SQLite commands if we're using SQLite (not PostgreSQL)
     if 'sqlite' in str(db.engine.url):
         try:
             db.session.execute(text('PRAGMA journal_mode=WAL'))
@@ -2861,7 +2789,6 @@ def init_db():
 
     db.session.commit()
     print("✅ Database initialized successfully!")
-
 
 with app.app_context():
     init_db()
