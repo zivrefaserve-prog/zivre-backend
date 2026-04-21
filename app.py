@@ -2645,7 +2645,28 @@ def ping():
         session.permanent = True
         return jsonify({'message': 'session active', 'user_id': user_id})
     return jsonify({'message': 'no session'}), 401
+# ==================== DEBUG SESSION ROUTE ====================
 
+@app.route('/api/debug/session', methods=['GET'])
+def debug_session():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({
+            'logged_in': False,
+            'session': dict(session),
+            'cookies': request.cookies.get('session'),
+            'message': 'No user in session'
+        }), 401
+    
+    user = db.session.get(User, user_id)
+    return jsonify({
+        'logged_in': True,
+        'user_id': user_id,
+        'role': user.role if user else None,
+        'email': user.email if user else None,
+        'session': dict(session),
+        'is_admin': user.role == 'admin' if user else False
+    })
 # ==================== INITIAL DATA ====================
 
 def init_db():
