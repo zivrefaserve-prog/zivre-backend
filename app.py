@@ -1819,26 +1819,7 @@ def rate_request(request_id):
 
 @app.route('/api/jobs/available', methods=['GET'])
 def get_available_jobs():
-    # Get the logged-in provider from session
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({'error': 'Authentication required'}), 401
-    
-    provider = db.session.get(User, user_id)
-    if not provider or provider.role != 'provider':
-        return jsonify({'error': 'Provider access required'}), 403
-    
-    # UNVERIFIED providers see NO jobs at all
-    if not provider.is_verified:
-        return jsonify([])
-    
-    # Verified providers ONLY see jobs matching their specialization
-    available_jobs = ServiceRequest.query.filter(
-        ServiceRequest.status == 'pending_approval',
-        ServiceRequest.provider_id == None,
-        ServiceRequest.service_id == provider.service_specialization_id
-    ).all()
-    
+    available_jobs = ServiceRequest.query.filter_by(status='pending_approval', provider_id=None).all()
     return jsonify([{
         'id': req.id,
         'service_name': req.service.name,
