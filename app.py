@@ -1636,7 +1636,7 @@ def approve_and_assign_request(request_id):
         
         socketio.emit('request_status_changed', {
             'request_id': request_id,
-            'status': 'assigned',
+            'status': 'pending_approval',  # ← Change from 'assigned' to 'pending_approval'
             'user_id': service_request.user_id,
             'provider_id': provider_id
         })
