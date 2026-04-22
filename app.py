@@ -748,11 +748,6 @@ def calculate_commission(referral_pool, level):
     return round(commission, 2) if commission >= 0.01 else 0
 
 def process_referral_commissions(booking, customer):
-   
-    """
-    Calculate and distribute referral commissions when customer confirms completion
-    Called when status becomes 'confirmed'
-    """
     self_bonus = 0  # ← ADD THIS LINE
     # Check if commissions already processed for this booking
     if booking.commissions_processed:
@@ -938,52 +933,7 @@ def signup():
         }
     })
 
-@app.route('/api/auth/login', methods=['POST'])
-@limiter.limit("10 per minute")
-def login():
-    data = request.json
-    user = User.query.filter_by(email=data.get('email')).first()
-    
-    if not user or not check_password_hash(user.password, data.get('password')):
-        return jsonify({'error': 'Invalid email or password'}), 401
-    
-    if not user.is_active:
-        return jsonify({'error': 'Account has been suspended'}), 401
-    
-    # Generate JWT token
-    token = jwt.encode({
-        'user_id': user.id,
-        'email': user.email,
-        'role': user.role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    }, JWT_SECRET, algorithm='HS256')
-    
-    print(f"✅ Login successful for user {user.email}")
-    
-    return jsonify({
-        'message': 'Login successful',
-        'token': token,
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'full_name': user.full_name,
-            'phone': user.phone,
-            'role': user.role,
-            'is_verified': user.is_verified,
-            'rating': user.rating,
-            'total_jobs': user.total_jobs,
-            'service_specialization': user.service_specialization.name if user.service_specialization else None,
-            'service_specialization_id': user.service_specialization_id,
-            'referral_code': user.referral_code,
-            'commission_balance': float(user.commission_balance or 0),
-            'total_earned': float(user.total_earned or 0),
-            'is_referral_active': user.is_referral_active
-        }
-    })
 
-
-    @app.route('/api/auth/login', methods=['POST'])
-@limiter.limit("10 per minute")
 def login():
     data = request.json
     user = User.query.filter_by(email=data.get('email')).first()
@@ -1027,7 +977,6 @@ def login():
         }
     })
     
-    # ========== HANDLE REFERRAL CODE ==========
     referrer_id = None
     position = None
     referral_code_input = data.get('referral_code')
