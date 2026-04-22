@@ -2800,6 +2800,27 @@ def init_db():
 with app.app_context():
     init_db()
 
+
+
+@app.route('/api/debug/session', methods=['GET'])
+def debug_session():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'No user in session'}), 401
+    
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    return jsonify({
+        'session_user_id': user_id,
+        'db_user_id': user.id,
+        'email': user.email,
+        'role': user.role,
+        'is_active': user.is_active,
+        'is_verified': user.is_verified
+    })
+    
 # ==================== RUN THE APP ====================
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
