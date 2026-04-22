@@ -1768,9 +1768,10 @@ def get_available_jobs():
     if not provider.is_verified:
         return jsonify([])
     
+    # ONLY show jobs where THIS SPECIFIC provider is assigned
     available_jobs = ServiceRequest.query.filter(
         ServiceRequest.status == 'pending_approval',
-        ServiceRequest.provider_id == None,
+        ServiceRequest.provider_id == provider.id,
         ServiceRequest.service_id == provider.service_specialization_id
     ).all()
     
