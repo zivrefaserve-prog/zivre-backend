@@ -999,7 +999,10 @@ def verify_token():
             'rating': request.current_user.rating,
             'total_jobs': request.current_user.total_jobs,
             'service_specialization': request.current_user.service_specialization.name if request.current_user.service_specialization else None,
-            'service_specialization_id': request.current_user.service_specialization_id
+            'service_specialization_id': request.current_user.service_specialization_id,
+            'referral_code': request.current_user.referral_code,
+            'commission_balance': float(request.current_user.commission_balance or 0),
+            'is_referral_active': request.current_user.is_referral_active
         }
     })
 
