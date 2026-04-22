@@ -169,7 +169,17 @@ class User(db.Model):
     avatar = db.Column(db.String(500), nullable=True)
     service_specialization_id = db.Column(db.Integer, db.ForeignKey('services.id'), nullable=True)
     
+    # ========== ADD THESE REFERRAL COLUMNS ==========
+    referrer_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    referral_code = db.Column(db.String(32), unique=True, nullable=True)
+    is_referral_active = db.Column(db.Boolean, default=False)  # Renamed from is_active to avoid conflict
+    commission_balance = db.Column(db.Float, default=0)
+    total_earned = db.Column(db.Float, default=0)
+    position = db.Column(db.String(10), nullable=True)  # left, center, right
+    # ===============================================
+    
     service_specialization = db.relationship('Service', foreign_keys=[service_specialization_id])
+
 
 class Service(db.Model):
     __tablename__ = 'services'
@@ -183,6 +193,14 @@ class Service(db.Model):
     icon = db.Column(db.String(10), nullable=False)
     is_active = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # ========== ADD THESE REFERRAL COLUMNS ==========
+    admin_share_percent = db.Column(db.Float, default=10.0)
+    website_share_percent = db.Column(db.Float, default=10.0)
+    provider_share_percent = db.Column(db.Float, default=80.0)
+    # ===============================================
+
+
 
 class Quote(db.Model):
     __tablename__ = 'quotes'
@@ -220,9 +238,20 @@ class ServiceRequest(db.Model):
     completed_at = db.Column(db.DateTime, nullable=True)
     declined_by = db.Column(db.Integer, nullable=True)
     
+    # ========== ADD THESE REFERRAL COLUMNS ==========
+    referral_pool_amount = db.Column(db.Float, default=0)
+    total_commissions_paid = db.Column(db.Float, default=0)
+    owner_net = db.Column(db.Float, default=0)
+    admin_share_percent_snapshot = db.Column(db.Float, default=10.0)
+    website_share_percent_snapshot = db.Column(db.Float, default=10.0)
+    provider_share_percent_snapshot = db.Column(db.Float, default=80.0)
+    commissions_processed = db.Column(db.Boolean, default=False)
+    # ===============================================
+    
     user = db.relationship('User', foreign_keys=[user_id])
     service = db.relationship('Service')
     provider = db.relationship('User', foreign_keys=[provider_id])
+    
 
 class Notification(db.Model):
     __tablename__ = 'notifications'
@@ -770,7 +799,7 @@ def process_referral_commissions(booking, customer):
             db.session.add(new_commission)
         
         # Activate user after first completed booking
-        customer.is_active = True
+        customer.is_referral_active = True
     
     # Process referral chain
     current_user = customer
@@ -780,7 +809,7 @@ def process_referral_commissions(booking, customer):
             break
         
         # Skip inactive referrers (they don't earn until active)
-        if not referrer.is_active:
+        if not referrer.is_referral_active:
             current_user = referrer
             continue
         
@@ -875,7 +904,7 @@ def signup():
         role=data.get('role', 'customer'),
         service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
         is_verified=False if data.get('role') == 'provider' else True,
-        is_active=False,
+        is_referral_active=False,
         referral_code=generate_referral_code(),
         referrer_id=referrer_id,
         position=position
@@ -2885,7 +2914,7 @@ def init_db():
     try:
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id INTEGER'))
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(32) UNIQUE'))
-        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT false'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_referral_active BOOLEAN DEFAULT false'))
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_balance DECIMAL(12,2) DEFAULT 0'))
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS total_earned DECIMAL(12,2) DEFAULT 0'))
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(10)'))
@@ -3311,7 +3340,7 @@ def get_my_referral_info():
         'referral_link': f"{frontend_url}/signup?ref={user.referral_code}",
         'commission_balance': float(user.commission_balance or 0),
         'total_earned': float(user.total_earned or 0),
-        'is_active': user.is_active,
+        'is_referral_active': user.is_referral_active,
         'referrer_id': user.referrer_id,
         'position': user.position
     })
@@ -3332,7 +3361,7 @@ def get_my_referral_tree():
             'full_name': u.full_name,
             'email': u.email,
             'commission_balance': float(u.commission_balance or 0),
-            'is_active': u.is_active,
+            'is_referral_active': u.is_referral_active,
             'total_earned': float(u.total_earned or 0),
             'position': u.position,
             'children': [build_tree(child, depth + 1, max_depth) for child in children],
@@ -3458,7 +3487,7 @@ def get_referral_kpis():
         'active_depth': active_depth,
         'total_earned': float(user.total_earned or 0),
         'current_balance': float(user.commission_balance or 0),
-        'is_active': user.is_active,
+        'is_referral_active': user.is_referral_active,
         'withdrawal_threshold': WITHDRAWAL_THRESHOLD_GHS
     })
 
@@ -3619,7 +3648,7 @@ def get_user_tree_for_admin(user_id):
             'full_name': u.full_name,
             'email': u.email,
             'commission_balance': float(u.commission_balance or 0),
-            'is_active': u.is_active,
+            'is_referral_active': u.is_referral_active,
             'total_earned': float(u.total_earned or 0),
             'position': u.position,
             'children': [build_tree(child, depth + 1, max_depth) for child in children],
