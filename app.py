@@ -71,8 +71,8 @@ db = SQLAlchemy(app)
 # Configure SocketIO with proper CORS
 socketio = SocketIO(app, 
     cors_allowed_origins="*", 
-    ping_timeout=60, 
-    ping_interval=25, 
+    ping_timeout=120,
+    ping_interval=60,
     async_mode='gevent',
     allow_upgrades=True,
     http_compression=False
@@ -2606,10 +2606,12 @@ def get_admin_stats():
     active_services = Service.query.filter_by(is_active=True).count()
     total_comments = Comment.query.count()
     
-    total_revenue = sum(r.amount for r in ServiceRequest.query.all())
-    total_admin_fees = sum(r.admin_fee for r in ServiceRequest.query.all())
-    total_site_fees = sum(r.site_fee for r in ServiceRequest.query.all())
-    total_provider_payouts = sum(r.provider_payout for r in ServiceRequest.query.filter_by(status='confirmed').all())
+    # ONLY count revenue from completed jobs (when provider marks complete)
+    completed_requests_list = ServiceRequest.query.filter_by(status='completed').all()
+    total_revenue = sum(r.amount for r in completed_requests_list)
+    total_admin_fees = sum(r.admin_fee for r in completed_requests_list)
+    total_site_fees = sum(r.site_fee for r in completed_requests_list)
+    total_provider_payouts = sum(r.provider_payout for r in completed_requests_list)
     
     return jsonify({
         'total_users': total_users,
