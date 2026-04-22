@@ -1888,11 +1888,24 @@ def confirm_request_completion(request_id):
         
         print(f"✅ Customer confirmed completion for request {request_id}")
         
+        # TRIGGER REFERRAL COMMISSIONS
+        commission_result = process_referral_commissions(service_request, request.current_user)
+        
+        if commission_result.get('success'):
+            print(f"💰 Referral commissions processed: {commission_result}")
+            if commission_result.get('self_bonus', 0) > 0:
+                create_notification(
+                    request.current_user.id,
+                    f'🎉 You earned GHS{commission_result["self_bonus"]} from your first booking! Share your referral code: {request.current_user.referral_code}',
+                    'success',
+                    '/referrals'
+                )
+        
         if service_request.provider_id:
             create_notification(
-                service_request.provider_id, 
-                f'✅ Customer confirmed completion for {service_request.service.name}. Thank you for your service!', 
-                'success', 
+                service_request.provider_id,
+                f'✅ Customer confirmed completion for {service_request.service.name}. Thank you for your service!',
+                'success',
                 '/provider/dashboard'
             )
             
@@ -1909,12 +1922,17 @@ def confirm_request_completion(request_id):
                 'provider_id': service_request.provider_id
             })
         
-        return jsonify({'message': 'Completion confirmed. Thank you for using Zivre!'})
+        return jsonify({
+            'message': 'Completion confirmed. Thank you for using Zivre!',
+            'commission_result': commission_result
+        })
     
     except Exception as e:
         db.session.rollback()
         print(f"❌ Error in confirm_request_completion: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+        
 
 @app.route('/api/requests/<int:request_id>/rate', methods=['POST'])
 @token_required
@@ -3175,6 +3193,338 @@ def delete_request_permanently(request_id):
         print(f"Error in delete_request_permanently: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
+# ==================== REFERRAL ENDPOINTS ====================
+
+@app.route('/api/referrals/my-info', methods=['GET'])
+@token_required
+def get_my_referral_info():
+    user = request.current_user
+    frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
+    
+    return jsonify({
+        'referral_code': user.referral_code,
+        'referral_link': f"{frontend_url}/signup?ref={user.referral_code}",
+        'commission_balance': float(user.commission_balance or 0),
+        'total_earned': float(user.total_earned or 0),
+        'is_active': user.is_active,
+        'referrer_id': user.referrer_id,
+        'position': user.position
+    })
+
+@app.route('/api/referrals/my-tree', methods=['GET'])
+@token_required
+def get_my_referral_tree():
+    user = request.current_user
+    
+    def build_tree(u, depth=0, max_depth=5):
+        if depth > max_depth:
+            return None
+        
+        children = User.query.filter_by(referrer_id=u.id).all()
+        
+        return {
+            'id': u.id,
+            'full_name': u.full_name,
+            'email': u.email,
+            'commission_balance': float(u.commission_balance or 0),
+            'is_active': u.is_active,
+            'total_earned': float(u.total_earned or 0),
+            'position': u.position,
+            'children': [build_tree(child, depth + 1, max_depth) for child in children],
+            'depth': depth
+        }
+    
+    tree = build_tree(user)
+    
+    return jsonify({'tree': tree})
+
+@app.route('/api/referrals/commission-history', methods=['GET'])
+@token_required
+def get_commission_history():
+    user = request.current_user
+    
+    commissions = Commission.query.filter_by(user_id=user.id).order_by(Commission.created_at.desc()).limit(100).all()
+    
+    return jsonify([{
+        'id': c.id,
+        'booking_id': c.booking_id,
+        'level': c.level,
+        'amount': float(c.amount),
+        'created_at': c.created_at.isoformat(),
+        'service_name': c.booking.service.name if c.booking and c.booking.service else 'Unknown',
+        'booking_amount': float(c.booking.amount) if c.booking else 0
+    } for c in commissions])
+
+@app.route('/api/referrals/withdraw', methods=['POST'])
+@token_required
+def request_withdrawal():
+    data = request.json
+    user = request.current_user
+    
+    amount = data.get('amount', 0)
+    payment_method = data.get('payment_method')
+    account_details = data.get('account_details')
+    
+    if not amount or amount < WITHDRAWAL_THRESHOLD_GHS:
+        return jsonify({'error': f'Minimum withdrawal amount is GHS{WITHDRAWAL_THRESHOLD_GHS}'}), 400
+    
+    if amount > (user.commission_balance or 0):
+        return jsonify({'error': 'Insufficient balance'}), 400
+    
+    if not payment_method or not account_details:
+        return jsonify({'error': 'Payment method and account details are required'}), 400
+    
+    # Deduct balance immediately
+    user.commission_balance = (user.commission_balance or 0) - amount
+    
+    withdrawal = WithdrawalRequest(
+        user_id=user.id,
+        amount=amount,
+        payment_method=payment_method,
+        account_details=account_details,
+        status='pending'
+    )
+    
+    db.session.add(withdrawal)
+    db.session.commit()
+    
+    # Notify admin
+    admin = User.query.filter_by(role='admin').first()
+    if admin:
+        create_notification(
+            admin.id,
+            f'💰 New withdrawal request from {user.full_name} for GHS{amount}',
+            'info',
+            '/admin/referrals'
+        )
+    
+    return jsonify({
+        'message': 'Withdrawal request submitted successfully',
+        'withdrawal_id': withdrawal.id,
+        'new_balance': float(user.commission_balance)
+    })
+
+@app.route('/api/referrals/withdrawal-history', methods=['GET'])
+@token_required
+def get_withdrawal_history():
+    user = request.current_user
+    
+    withdrawals = WithdrawalRequest.query.filter_by(user_id=user.id).order_by(WithdrawalRequest.requested_at.desc()).all()
+    
+    return jsonify([{
+        'id': w.id,
+        'amount': float(w.amount),
+        'payment_method': w.payment_method,
+        'account_details': w.account_details,
+        'status': w.status,
+        'requested_at': w.requested_at.isoformat(),
+        'admin_processed_at': w.admin_processed_at.isoformat() if w.admin_processed_at else None,
+        'user_confirmed_at': w.user_confirmed_at.isoformat() if w.user_confirmed_at else None
+    } for w in withdrawals])
+
+@app.route('/api/referrals/kpis', methods=['GET'])
+@token_required
+def get_referral_kpis():
+    user = request.current_user
+    
+    def count_downline(u_id):
+        direct = User.query.filter_by(referrer_id=u_id).count()
+        total = direct
+        for child in User.query.filter_by(referrer_id=u_id).all():
+            total += count_downline(child.id)
+        return total
+    
+    downline_count = count_downline(user.id)
+    
+    def get_max_depth(u_id, current_depth=1):
+        children = User.query.filter_by(referrer_id=u_id).all()
+        if not children:
+            return current_depth
+        max_child_depth = 0
+        for child in children:
+            depth = get_max_depth(child.id, current_depth + 1)
+            max_child_depth = max(max_child_depth, depth)
+        return max_child_depth
+    
+    active_depth = get_max_depth(user.id) if downline_count > 0 else 0
+    
+    return jsonify({
+        'downline_count': downline_count,
+        'active_depth': active_depth,
+        'total_earned': float(user.total_earned or 0),
+        'current_balance': float(user.commission_balance or 0),
+        'is_active': user.is_active,
+        'withdrawal_threshold': WITHDRAWAL_THRESHOLD_GHS
+    })
+
+# ==================== ADMIN REFERRAL ENDPOINTS ====================
+
+@app.route('/api/admin/referrals/pending-withdrawals', methods=['GET'])
+@admin_required
+def get_pending_withdrawals():
+    withdrawals = WithdrawalRequest.query.filter_by(status='pending').order_by(WithdrawalRequest.requested_at.asc()).all()
+    
+    return jsonify([{
+        'id': w.id,
+        'user_id': w.user_id,
+        'user_name': w.user.full_name,
+        'user_email': w.user.email,
+        'user_phone': w.user.phone,
+        'amount': float(w.amount),
+        'payment_method': w.payment_method,
+        'account_details': w.account_details,
+        'requested_at': w.requested_at.isoformat()
+    } for w in withdrawals])
+
+@app.route('/api/admin/referrals/withdrawals/<int:withdrawal_id>/mark-sent', methods=['PUT'])
+@admin_required
+def mark_withdrawal_sent(withdrawal_id):
+    data = request.json
+    notes = data.get('notes', '')
+    
+    withdrawal = db.session.get(WithdrawalRequest, withdrawal_id)
+    if not withdrawal:
+        return jsonify({'error': 'Withdrawal request not found'}), 404
+    
+    if withdrawal.status != 'pending':
+        return jsonify({'error': f'Withdrawal already {withdrawal.status}'}), 400
+    
+    withdrawal.status = 'admin_sent'
+    withdrawal.admin_processed_at = datetime.utcnow()
+    withdrawal.admin_notes = notes
+    
+    db.session.commit()
+    
+    create_notification(
+        withdrawal.user_id,
+        f'💰 Your withdrawal of GHS{withdrawal.amount} has been sent to your {withdrawal.payment_method}. Please confirm receipt.',
+        'success',
+        '/referrals'
+    )
+    
+    return jsonify({'message': 'Withdrawal marked as sent', 'status': 'admin_sent'})
+
+@app.route('/api/referrals/withdrawals/<int:withdrawal_id>/confirm', methods=['PUT'])
+@token_required
+def confirm_withdrawal_receipt(withdrawal_id):
+    withdrawal = db.session.get(WithdrawalRequest, withdrawal_id)
+    
+    if not withdrawal:
+        return jsonify({'error': 'Withdrawal request not found'}), 404
+    
+    if withdrawal.user_id != request.current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    if withdrawal.status != 'admin_sent':
+        return jsonify({'error': f'Cannot confirm. Current status: {withdrawal.status}'}), 400
+    
+    withdrawal.status = 'user_confirmed'
+    withdrawal.user_confirmed_at = datetime.utcnow()
+    
+    db.session.commit()
+    
+    return jsonify({'message': 'Withdrawal confirmed successfully', 'status': 'user_confirmed'})
+
+@app.route('/api/admin/referrals/owner-net-summary', methods=['GET'])
+@admin_required
+def get_owner_net_summary():
+    bookings = ServiceRequest.query.filter(
+        ServiceRequest.status == 'confirmed',
+        ServiceRequest.commissions_processed == True
+    ).all()
+    
+    total_pool = sum(b.referral_pool_amount or 0 for b in bookings)
+    total_commissions = sum(b.total_commissions_paid or 0 for b in bookings)
+    total_owner_net = sum(b.owner_net or 0 for b in bookings)
+    
+    return jsonify({
+        'total_referral_pool': float(total_pool),
+        'total_commissions_paid': float(total_commissions),
+        'total_owner_net': float(total_owner_net),
+        'total_bookings': len(bookings)
+    })
+
+@app.route('/api/admin/referrals/pending-bookings', methods=['GET'])
+@admin_required
+def get_pending_bookings_for_commission():
+    bookings = ServiceRequest.query.filter(
+        ServiceRequest.status == 'completed',
+        ServiceRequest.provider_completed == True,
+        ServiceRequest.customer_confirmed == False
+    ).all()
+    
+    return jsonify([{
+        'id': b.id,
+        'customer_name': b.user.full_name if b.user else 'Unknown',
+        'customer_phone': b.customer_phone,
+        'service_name': b.service.name if b.service else 'Unknown',
+        'amount': float(b.amount),
+        'provider_name': b.provider.full_name if b.provider else 'Not assigned',
+        'completed_at': b.completed_at.isoformat() if b.completed_at else None
+    } for b in bookings])
+
+@app.route('/api/admin/services/<int:service_id>/shares', methods=['PUT'])
+@admin_required
+def update_service_shares(service_id):
+    data = request.json
+    
+    service = db.session.get(Service, service_id)
+    if not service:
+        return jsonify({'error': 'Service not found'}), 404
+    
+    if 'admin_share_percent' in data:
+        service.admin_share_percent = data['admin_share_percent']
+    if 'website_share_percent' in data:
+        service.website_share_percent = data['website_share_percent']
+    if 'provider_share_percent' in data:
+        service.provider_share_percent = data['provider_share_percent']
+    
+    total = (service.admin_share_percent or 0) + (service.website_share_percent or 0) + (service.provider_share_percent or 0)
+    if abs(total - 100) > 0.01:
+        return jsonify({'error': f'Total shares must equal 100%. Current total: {total}%'}), 400
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Service shares updated successfully',
+        'service': {
+            'id': service.id,
+            'name': service.name,
+            'admin_share_percent': service.admin_share_percent,
+            'website_share_percent': service.website_share_percent,
+            'provider_share_percent': service.provider_share_percent
+        }
+    })
+
+@app.route('/api/admin/referrals/user-tree/<int:user_id>', methods=['GET'])
+@admin_required
+def get_user_tree_for_admin(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    def build_tree(u, depth=0, max_depth=5):
+        if depth > max_depth:
+            return None
+        
+        children = User.query.filter_by(referrer_id=u.id).all()
+        
+        return {
+            'id': u.id,
+            'full_name': u.full_name,
+            'email': u.email,
+            'commission_balance': float(u.commission_balance or 0),
+            'is_active': u.is_active,
+            'total_earned': float(u.total_earned or 0),
+            'position': u.position,
+            'children': [build_tree(child, depth + 1, max_depth) for child in children],
+            'depth': depth
+        }
+    
+    tree = build_tree(user)
+    
+    return jsonify({'tree': tree})
 
 # ==================== RUN THE APP ====================
 if __name__ == '__main__':
