@@ -820,68 +820,7 @@ def process_referral_commissions(booking, customer):
         'self_bonus': self_bonus if user_completed_bookings == 0 else 0
     }
 # ==================== AUTH ROUTES ====================
-
-@app.route('/api/auth/signup', methods=['POST'])
-@limiter.limit("10 per minute")
-def signup():
-    data = request.json
-    
-    if User.query.filter_by(email=data.get('email')).first():
-        return jsonify({'error': 'Email already exists'}), 400
-    
-    if not validate_email(data.get('email')):
-        return jsonify({'error': 'Invalid email format'}), 400
-    
-    is_valid, password_msg = validate_password(data.get('password'))
-    if not is_valid:
-        return jsonify({'error': password_msg}), 400
-    
-    hashed_password = generate_password_hash(data.get('password'))
-    
-    service_specialization_id = data.get('service_specialization')
-    
-    if data.get('role') == 'provider' and service_specialization_id:
-        service = db.session.get(Service, service_specialization_id)
-        if not service:
-            return jsonify({'error': 'Selected service specialization does not exist'}), 400
-        if not service.is_active:
-            return jsonify({'error': 'Selected service is not active'}), 400
-    
-    new_user = User(
-        email=data.get('email'),
-        password=hashed_password,
-        full_name=data.get('full_name'),
-        phone=data.get('phone'),
-        role=data.get('role', 'customer'),
-        service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
-        is_verified=False if data.get('role') == 'provider' else True
-    )
-    
-    db.session.add(new_user)
-    db.session.commit()
-    
-    # ✅ ADD THIS - Generate JWT token for auto-login after signup
-    token = jwt.encode({
-        'user_id': new_user.id,
-        'email': new_user.email,
-        'role': new_user.role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    }, JWT_SECRET, algorithm='HS256')
-    
-    return jsonify({
-        'message': 'User created successfully',
-        'token': token,  # ← ADD THIS LINE
-        'user': {
-            'id': new_user.id,
-            'email': new_user.email,
-            'full_name': new_user.full_name,
-            'role': new_user.role,
-            'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None
-        }
-    })
-
-
-    
+  
 @app.route('/api/auth/signup', methods=['POST'])
 @limiter.limit("10 per minute")
 def signup():
