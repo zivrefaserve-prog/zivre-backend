@@ -975,7 +975,7 @@ def signup():
             'commission_balance': float(new_user.commission_balance or 0)
         }
     })
-    # ← DELETE everything after this line (the duplicate code)
+  
    
 
 
