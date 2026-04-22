@@ -711,8 +711,17 @@ def signup():
     db.session.add(new_user)
     db.session.commit()
     
+    # ✅ ADD THIS - Generate JWT token for auto-login after signup
+    token = jwt.encode({
+        'user_id': new_user.id,
+        'email': new_user.email,
+        'role': new_user.role,
+        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    }, JWT_SECRET, algorithm='HS256')
+    
     return jsonify({
         'message': 'User created successfully',
+        'token': token,  # ← ADD THIS LINE
         'user': {
             'id': new_user.id,
             'email': new_user.email,
@@ -721,6 +730,9 @@ def signup():
             'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None
         }
     })
+
+
+    
 
 @app.route('/api/auth/login', methods=['POST'])
 @limiter.limit("10 per minute")
