@@ -41,6 +41,11 @@ app.config['SESSION_REFRESH_EACH_REQUEST'] = True
 JWT_SECRET = os.environ.get('JWT_SECRET', 'zivre-super-secret-key-change-in-production-2024')
 JWT_EXPIRY_HOURS = 24
 
+# Request Status Constants
+REQUEST_STATUS_CANCELLED_BY_CUSTOMER = 'cancelled_by_customer'
+REQUEST_STATUS_REJECTED_BY_ADMIN = 'rejected_by_admin'
+REQUEST_STATUS_DECLINED_BY_PROVIDER = 'declined_by_provider'
+
 # File upload configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
@@ -207,6 +212,7 @@ class ServiceRequest(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     assigned_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
+    declined_by = db.Column(db.Integer, nullable=True)
     
     user = db.relationship('User', foreign_keys=[user_id])
     service = db.relationship('Service')
@@ -2863,7 +2869,152 @@ def debug_session():
         'is_active': request.current_user.is_active,
         'is_verified': request.current_user.is_verified
     })
+# ====================  ====================    
+@app.route('/api/requests/<int:request_id>/cancel', methods=['PUT'])
+@token_required
+def cancel_request(request_id):
+    try:
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.user_id != request.current_user.id:
+            return jsonify({'error': 'You can only cancel your own requests'}), 403
+        
+        if service_request.status not in ['pending_approval', 'assigned']:
+            return jsonify({'error': f'Cannot cancel. Current status: {service_request.status}'}), 400
+        
+        service_request.status = REQUEST_STATUS_CANCELLED_BY_CUSTOMER
+        db.session.commit()
+        
+        if service_request.provider_id:
+            create_notification(
+                service_request.provider_id,
+                f'❌ Customer cancelled the {service_request.service.name} job.',
+                'warning',
+                '/provider/dashboard'
+            )
+        
+        admin = User.query.filter_by(role='admin').first()
+        if admin:
+            create_notification(
+                admin.id,
+                f'📝 Request #{request_id} for {service_request.service.name} was cancelled by customer.',
+                'info',
+                '/admin/dashboard'
+            )
+        
+        return jsonify({'message': 'Request cancelled successfully'})
     
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in cancel_request: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/requests/<int:request_id>/reject', methods=['PUT'])
+@admin_required
+def reject_request(request_id):
+    try:
+        data = request.json
+        reason = data.get('reason', 'No reason provided')
+        
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.status != 'pending_approval':
+            return jsonify({'error': f'Cannot reject. Current status: {service_request.status}'}), 400
+        
+        service_request.status = REQUEST_STATUS_REJECTED_BY_ADMIN
+        db.session.commit()
+        
+        create_notification(
+            service_request.user_id,
+            f'❌ Your request for {service_request.service.name} was rejected. Reason: {reason}',
+            'error',
+            '/customer/dashboard'
+        )
+        
+        return jsonify({'message': 'Request rejected successfully'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in reject_request: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/jobs/<int:job_id>/decline', methods=['PUT'])
+@token_required
+def decline_job(job_id):
+    try:
+        data = request.json
+        reason = data.get('reason', 'No reason provided')
+        
+        service_request = db.session.get(ServiceRequest, job_id)
+        if not service_request:
+            return jsonify({'error': 'Job not found'}), 404
+        
+        if service_request.provider_id != request.current_user.id:
+            return jsonify({'error': 'You can only decline jobs assigned to you'}), 403
+        
+        if service_request.status not in ['assigned', 'in_progress']:
+            return jsonify({'error': f'Cannot decline. Current status: {service_request.status}'}), 400
+        
+        service_request.provider_id = None
+        service_request.status = 'pending_approval'
+        db.session.commit()
+        
+        create_notification(
+            service_request.user_id,
+            f'⚠️ Provider declined your {service_request.service.name} request. Reason: {reason}. Admin will assign another provider.',
+            'warning',
+            '/customer/dashboard'
+        )
+        
+        admin = User.query.filter_by(role='admin').first()
+        if admin:
+            create_notification(
+                admin.id,
+                f'⚠️ Provider declined job #{job_id}. Please reassign.',
+                'warning',
+                '/admin/dashboard'
+            )
+        
+        return jsonify({'message': 'Job declined successfully'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in decline_job: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+@app.route('/api/admin/requests/<int:request_id>/delete', methods=['DELETE'])
+@admin_required
+def delete_request_permanently(request_id):
+    try:
+        service_request = db.session.get(ServiceRequest, request_id)
+        if not service_request:
+            return jsonify({'error': 'Request not found'}), 404
+        
+        customer_id = service_request.user_id
+        service_name = service_request.service.name if service_request.service else 'Unknown'
+        
+        db.session.delete(service_request)
+        db.session.commit()
+        
+        create_notification(
+            customer_id,
+            f'🗑️ Your request for {service_name} has been deleted by admin.',
+            'warning',
+            '/customer/dashboard'
+        )
+        
+        return jsonify({'message': 'Request permanently deleted successfully'})
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in delete_request_permanently: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ==================== RUN THE APP ====================
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
