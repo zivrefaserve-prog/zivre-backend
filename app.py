@@ -14,6 +14,7 @@ import uuid
 import os
 import re
 import bleach
+import secrets
 import math
 from dotenv import load_dotenv
 from flask_limiter import Limiter
@@ -40,6 +41,11 @@ app.config['SESSION_REFRESH_EACH_REQUEST'] = True
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'zivre-super-secret-key-change-in-production-2024')
 JWT_EXPIRY_HOURS = 24
+# Referral System Configuration
+WITHDRAWAL_THRESHOLD_GHS = 20
+COMMISSION_DECAY_FACTOR = 0.5
+BASE_COMMISSION_RATE = 0.20
+MAX_REFERRAL_DEPTH = 100
 
 # Request Status Constants
 REQUEST_STATUS_CANCELLED_BY_CUSTOMER = 'cancelled_by_customer'
@@ -304,7 +310,33 @@ class PercentageSetting(db.Model):
     def is_valid(self):
         total = self.get_total()
         return abs(total - 100.0) < 0.01
+# ==================== Referal models====================
+class Commission(db.Model):
+    __tablename__ = 'commissions'
+    id = db.Column(db.Integer, primary_key=True)
+    booking_id = db.Column(db.Integer, db.ForeignKey('service_requests.id', ondelete='CASCADE'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    level = db.Column(db.Integer)
+    amount = db.Column(db.Float, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    booking = db.relationship('ServiceRequest', foreign_keys=[booking_id])
+    user = db.relationship('User', foreign_keys=[user_id])
 
+class WithdrawalRequest(db.Model):
+    __tablename__ = 'withdrawal_requests'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    amount = db.Column(db.Float, default=0)
+    payment_method = db.Column(db.String(20))
+    account_details = db.Column(db.String(500))
+    status = db.Column(db.String(20), default='pending')
+    requested_at = db.Column(db.DateTime, default=datetime.utcnow)
+    admin_processed_at = db.Column(db.DateTime, nullable=True)
+    user_confirmed_at = db.Column(db.DateTime, nullable=True)
+    admin_notes = db.Column(db.String(500))
+    
+    user = db.relationship('User', foreign_keys=[user_id])
 # ==================== HELPER FUNCTIONS ====================
 
 def allowed_file(filename):
@@ -670,6 +702,123 @@ def update_percentages():
         }
     })
 
+# ====================  HELPER FUNCTION ====================
+
+def generate_referral_code():
+    """Generate a unique referral code for a user"""
+    while True:
+        code = secrets.token_urlsafe(8).upper().replace('-', '').replace('_', '')
+        existing = User.query.filter_by(referral_code=code).first()
+        if not existing:
+            return code
+
+def calculate_commission(referral_pool, level):
+    """Calculate commission based on level (geometric decay)"""
+    rate = BASE_COMMISSION_RATE * (COMMISSION_DECAY_FACTOR ** (level - 1))
+    commission = referral_pool * rate
+    return round(commission, 2) if commission >= 0.01 else 0
+
+def process_referral_commissions(booking, customer):
+    """
+    Calculate and distribute referral commissions when customer confirms completion
+    Called when status becomes 'confirmed'
+    """
+    # Check if commissions already processed for this booking
+    if booking.commissions_processed:
+        return {'already_processed': True, 'total_commissions': booking.total_commissions_paid}
+    
+    # Get service to get share percentages
+    service = db.session.get(Service, booking.service_id)
+    if not service:
+        return {'error': 'Service not found'}
+    
+    # Calculate referral pool (admin share + website share)
+    admin_share = service.admin_share_percent or 10.0
+    website_share = service.website_share_percent or 10.0
+    referral_pool = booking.amount * (admin_share + website_share) / 100
+    
+    # Store snapshot in booking
+    booking.referral_pool_amount = referral_pool
+    booking.admin_share_percent_snapshot = admin_share
+    booking.website_share_percent_snapshot = website_share
+    booking.provider_share_percent_snapshot = service.provider_share_percent or 80.0
+    
+    total_commissions = 0
+    level = 1
+    current_user = customer
+    
+    # Check if this is customer's first completed booking
+    user_completed_bookings = ServiceRequest.query.filter_by(
+        user_id=customer.id, 
+        status='confirmed'
+    ).count()
+    
+    # First booking? Give self-bonus (20% of referral pool)
+    if user_completed_bookings == 0:
+        self_bonus = referral_pool * 0.20
+        if self_bonus >= 0.01:
+            customer.commission_balance = (customer.commission_balance or 0) + self_bonus
+            customer.total_earned = (customer.total_earned or 0) + self_bonus
+            total_commissions += self_bonus
+            
+            new_commission = Commission(
+                booking_id=booking.id,
+                user_id=customer.id,
+                level=0,
+                amount=self_bonus
+            )
+            db.session.add(new_commission)
+        
+        # Activate user after first completed booking
+        customer.is_active = True
+    
+    # Process referral chain
+    current_user = customer
+    while current_user and current_user.referrer_id and level <= MAX_REFERRAL_DEPTH:
+        referrer = db.session.get(User, current_user.referrer_id)
+        if not referrer:
+            break
+        
+        # Skip inactive referrers (they don't earn until active)
+        if not referrer.is_active:
+            current_user = referrer
+            continue
+        
+        commission = calculate_commission(referral_pool, level)
+        
+        if commission < 0.01:
+            break
+        
+        referrer.commission_balance = (referrer.commission_balance or 0) + commission
+        referrer.total_earned = (referrer.total_earned or 0) + commission
+        total_commissions += commission
+        
+        new_commission = Commission(
+            booking_id=booking.id,
+            user_id=referrer.id,
+            level=level,
+            amount=commission
+        )
+        db.session.add(new_commission)
+        
+        level += 1
+        current_user = referrer
+    
+    # Calculate owner net (platform profit)
+    booking.total_commissions_paid = total_commissions
+    booking.owner_net = referral_pool - total_commissions
+    booking.commissions_processed = True
+    
+    db.session.commit()
+    
+    return {
+        'success': True,
+        'referral_pool': referral_pool,
+        'total_commissions': total_commissions,
+        'owner_net': booking.owner_net,
+        'levels_processed': level - 1,
+        'self_bonus': self_bonus if user_completed_bookings == 0 else 0
+    }
 # ==================== AUTH ROUTES ====================
 
 @app.route('/api/auth/signup', methods=['POST'])
