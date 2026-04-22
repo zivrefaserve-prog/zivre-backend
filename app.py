@@ -882,45 +882,94 @@ def signup():
 
 
     
-
-@app.route('/api/auth/login', methods=['POST'])
+@app.route('/api/auth/signup', methods=['POST'])
 @limiter.limit("10 per minute")
-def login():
+def signup():
     data = request.json
-    user = User.query.filter_by(email=data.get('email')).first()
     
-    if not user or not check_password_hash(user.password, data.get('password')):
-        return jsonify({'error': 'Invalid email or password'}), 401
+    if User.query.filter_by(email=data.get('email')).first():
+        return jsonify({'error': 'Email already exists'}), 400
     
-    if not user.is_active:
-        return jsonify({'error': 'Account has been suspended'}), 401
+    if not validate_email(data.get('email')):
+        return jsonify({'error': 'Invalid email format'}), 400
     
-    # Generate JWT token
+    is_valid, password_msg = validate_password(data.get('password'))
+    if not is_valid:
+        return jsonify({'error': password_msg}), 400
+    
+    hashed_password = generate_password_hash(data.get('password'))
+    
+    service_specialization_id = data.get('service_specialization')
+    
+    if data.get('role') == 'provider' and service_specialization_id:
+        service = db.session.get(Service, service_specialization_id)
+        if not service:
+            return jsonify({'error': 'Selected service specialization does not exist'}), 400
+        if not service.is_active:
+            return jsonify({'error': 'Selected service is not active'}), 400
+    
+    # ========== HANDLE REFERRAL CODE ==========
+    referrer_id = None
+    position = None
+    referral_code_input = data.get('referral_code')
+    
+    if referral_code_input:
+        referrer = User.query.filter_by(referral_code=referral_code_input).first()
+        if referrer:
+            referrer_id = referrer.id
+            children_count = User.query.filter_by(referrer_id=referrer.id).count()
+            if children_count == 0:
+                position = 'left'
+            elif children_count == 1:
+                position = 'center'
+            elif children_count == 2:
+                position = 'right'
+            else:
+                return jsonify({'error': 'This referrer already has maximum children (3)'}), 400
+    
+    # ========== CREATE NEW USER ==========
+    new_user = User(
+        email=data.get('email'),
+        password=hashed_password,
+        full_name=data.get('full_name'),
+        phone=data.get('phone'),
+        role=data.get('role', 'customer'),
+        service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
+        is_verified=False if data.get('role') == 'provider' else True,
+        is_active=False,
+        referral_code=generate_referral_code(),
+        referrer_id=referrer_id,
+        position=position
+    )
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    # Generate JWT token for auto-login
     token = jwt.encode({
-        'user_id': user.id,
-        'email': user.email,
-        'role': user.role,
+        'user_id': new_user.id,
+        'email': new_user.email,
+        'role': new_user.role,
         'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
     }, JWT_SECRET, algorithm='HS256')
     
-    print(f"✅ Login successful for user {user.email}")
-    
     return jsonify({
-        'message': 'Login successful',
+        'message': 'User created successfully',
         'token': token,
         'user': {
-            'id': user.id,
-            'email': user.email,
-            'full_name': user.full_name,
-            'phone': user.phone,
-            'role': user.role,
-            'is_verified': user.is_verified,
-            'rating': user.rating,
-            'total_jobs': user.total_jobs,
-            'service_specialization': user.service_specialization.name if user.service_specialization else None,
-            'service_specialization_id': user.service_specialization_id
+            'id': new_user.id,
+            'email': new_user.email,
+            'full_name': new_user.full_name,
+            'role': new_user.role,
+            'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None,
+            'referral_code': new_user.referral_code,
+            'is_active': new_user.is_active,
+            'commission_balance': float(new_user.commission_balance or 0)
         }
     })
+
+    
+
 
 @app.route('/api/auth/logout', methods=['POST'])
 @token_required
@@ -2888,6 +2937,122 @@ def ping():
 
 def init_db():
     db.create_all()
+    
+    # ============================================
+    # REFERRAL SYSTEM - AUTO CREATE TABLES & COLUMNS
+    # ============================================
+    
+    # 1. Add referral columns to users table
+    try:
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id INTEGER'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(32) UNIQUE'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT false'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_balance DECIMAL(12,2) DEFAULT 0'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS total_earned DECIMAL(12,2) DEFAULT 0'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(10)'))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_users_referrer_id ON users(referrer_id)'))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)'))
+        db.session.commit()
+        print("✅ Referral columns added to users table")
+    except Exception as e:
+        print(f"⚠️ Users columns note: {e}")
+    
+    # 2. Add share columns to services table
+    try:
+        db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS admin_share_percent DECIMAL(5,2) DEFAULT 10.0'))
+        db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS website_share_percent DECIMAL(5,2) DEFAULT 10.0'))
+        db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS provider_share_percent DECIMAL(5,2) DEFAULT 80.0'))
+        db.session.commit()
+        print("✅ Share columns added to services table")
+    except Exception as e:
+        print(f"⚠️ Services columns note: {e}")
+    
+    # 3. Add referral tracking to service_requests
+    try:
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS referral_pool_amount DECIMAL(12,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS total_commissions_paid DECIMAL(12,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS owner_net DECIMAL(12,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS admin_share_percent_snapshot DECIMAL(5,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS website_share_percent_snapshot DECIMAL(5,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS provider_share_percent_snapshot DECIMAL(5,2)'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS commissions_processed BOOLEAN DEFAULT false'))
+        db.session.commit()
+        print("✅ Referral tracking columns added to service_requests")
+    except Exception as e:
+        print(f"⚠️ Service requests columns note: {e}")
+    
+    # 4. Create commissions table
+    try:
+        db.session.execute(text('''
+            CREATE TABLE IF NOT EXISTS commissions (
+                id SERIAL PRIMARY KEY,
+                booking_id INTEGER REFERENCES service_requests(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                level INTEGER,
+                amount DECIMAL(12,2),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_commissions_booking_id ON commissions(booking_id)'))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_commissions_user_id ON commissions(user_id)'))
+        db.session.commit()
+        print("✅ Commissions table created")
+    except Exception as e:
+        print(f"⚠️ Commissions table note: {e}")
+    
+    # 5. Create withdrawal_requests table
+    try:
+        db.session.execute(text('''
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                amount DECIMAL(12,2),
+                payment_method VARCHAR(20),
+                account_details TEXT,
+                status VARCHAR(20) DEFAULT 'pending',
+                requested_at TIMESTAMP DEFAULT NOW(),
+                admin_processed_at TIMESTAMP,
+                user_confirmed_at TIMESTAMP,
+                admin_notes TEXT
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_user_id ON withdrawal_requests(user_id)'))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status)'))
+        db.session.commit()
+        print("✅ Withdrawal requests table created")
+    except Exception as e:
+        print(f"⚠️ Withdrawal requests table note: {e}")
+    
+    # 6. Update existing services with default shares
+    try:
+        db.session.execute(text('''
+            UPDATE services SET 
+                admin_share_percent = 10.0,
+                website_share_percent = 10.0,
+                provider_share_percent = 80.0
+            WHERE admin_share_percent IS NULL
+        '''))
+        db.session.commit()
+        print("✅ Default shares updated for services")
+    except Exception as e:
+        print(f"⚠️ Services update note: {e}")
+    
+    # 7. Generate referral codes for existing users who don't have one
+    try:
+        db.session.execute(text('''
+            UPDATE users SET referral_code = UPPER(SUBSTRING(MD5(id::TEXT) FROM 1 FOR 8))
+            WHERE referral_code IS NULL
+        '''))
+        db.session.commit()
+        print("✅ Referral codes generated for existing users")
+    except Exception as e:
+        print(f"⚠️ Referral codes note: {e}")
+    
+    # ============================================
+    # END OF REFERRAL SYSTEM MIGRATION
+    # ============================================
+    
+    # ========== YOUR EXISTING CODE CONTINUES BELOW ==========
     
     if not PercentageSetting.query.first():
         default_percentages = PercentageSetting(
