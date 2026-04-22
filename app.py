@@ -1755,24 +1755,19 @@ def rate_request(request_id):
     return jsonify({'message': 'Rating submitted'})
 
 # ==================== JOB/PROVIDER ROUTES ====================
-
 @app.route('/api/jobs/available', methods=['GET'])
 def get_available_jobs():
-    # Get the logged-in provider from session
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({'error': 'Authentication required'}), 401
+        return jsonify([])
     
     provider = db.session.get(User, user_id)
     if not provider or provider.role != 'provider':
-        return jsonify({'error': 'Provider access required'}), 403
+        return jsonify([])
     
-    # UNVERIFIED providers see NO jobs
     if not provider.is_verified:
         return jsonify([])
     
-    # Verified providers ONLY see jobs matching their specialization
-    # AND jobs that are pending approval and not assigned to anyone
     available_jobs = ServiceRequest.query.filter(
         ServiceRequest.status == 'pending_approval',
         ServiceRequest.provider_id == None,
@@ -1791,6 +1786,7 @@ def get_available_jobs():
         'amount': req.amount,
         'provider_payout': req.provider_payout
     } for req in available_jobs])
+
 
 @app.route('/api/jobs/claim', methods=['POST'])
 def claim_job():
@@ -2735,7 +2731,7 @@ def init_db():
             db.session.add(service)
             created_services.append(service)
     
-    admin = User.query.filter_by(email='admin@zivre.com').first()
+        admin = User.query.filter_by(email='admin@zivre.com').first()
     if not admin:
         admin = User(
             email='admin@zivre.com',
@@ -2743,9 +2739,19 @@ def init_db():
             full_name='Admin User',
             phone='+233000000000',
             role='admin',
-            is_verified=True
+            is_verified=True,
+            is_active=True
         )
         db.session.add(admin)
+    else:
+        # Ensure admin is active and password is correct
+        admin.is_active = True
+        admin.is_verified = True
+        if not check_password_hash(admin.password, 'Admin123!'):
+            admin.password = generate_password_hash('Admin123!')
+        db.session.add(admin)
+
+        
     
     hvac_service = Service.query.filter_by(name='HVAC Systems').first()
     
