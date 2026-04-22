@@ -2625,7 +2625,7 @@ def get_admin_stats():
     total_comments = Comment.query.count()
     
     # ONLY count revenue from completed jobs (when provider marks complete)
-    completed_requests_list = ServiceRequest.query.filter_by(status='completed').all()
+    completed_requests_list = ServiceRequest.query.filter(ServiceRequest.status.in_(['completed', 'confirmed'])).all()
     total_revenue = sum(r.amount for r in completed_requests_list)
     total_admin_fees = sum(r.admin_fee for r in completed_requests_list)
     total_site_fees = sum(r.site_fee for r in completed_requests_list)
