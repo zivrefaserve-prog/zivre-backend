@@ -1616,7 +1616,7 @@ def approve_and_assign_request(request_id):
         service = db.session.get(Service, service_request.service_id)
         
         service_request.provider_id = provider_id
-        service_request.status = 'assigned'
+       service_request.status = 'pending_approval'
         service_request.assigned_at = datetime.utcnow()
         
         provider.total_jobs = (provider.total_jobs or 0) + 1
