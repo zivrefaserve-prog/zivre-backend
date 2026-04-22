@@ -20,6 +20,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from sqlalchemy import text
 import mimetypes
+import jwt
 
 load_dotenv()
 
@@ -35,6 +36,10 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_PERMANENT'] = True
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 app.config['SESSION_REFRESH_EACH_REQUEST'] = True
+
+# JWT Configuration
+JWT_SECRET = os.environ.get('JWT_SECRET', 'zivre-super-secret-key-change-in-production-2024')
+JWT_EXPIRY_HOURS = 24
 
 # File upload configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,21 +90,38 @@ CORS(app,
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["1000000 per day", "100000 per hour", "10000 per minute"], storage_uri=os.environ.get('RATELIMIT_STORAGE_URL', 'memory://'))
 
-# ==================== ADMIN REQUIRED DECORATOR ====================
+# ==================== JWT DECORATORS ====================
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token or not token.startswith('Bearer '):
+            return jsonify({'error': 'Token missing or invalid'}), 401
+        
+        token = token.split(' ')[1]
+        try:
+            data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            current_user = db.session.get(User, data['user_id'])
+            if not current_user:
+                return jsonify({'error': 'User not found'}), 401
+            if not current_user.is_active:
+                return jsonify({'error': 'Account suspended'}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        request.current_user = current_user
+        return f(*args, **kwargs)
+    return decorated
 
 def admin_required(f):
     @wraps(f)
+    @token_required
     def decorated_function(*args, **kwargs):
-        user_id = session.get('user_id')
-        print(f"🔐 Admin check - Session user_id: {user_id}, Session contents: {dict(session)}")
-        
-        if not user_id:
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        user = db.session.get(User, user_id)
-        if not user or user.role != 'admin':
+        if request.current_user.role != 'admin':
             return jsonify({'error': 'Admin access required'}), 403
-        
         return f(*args, **kwargs)
     return decorated_function
 
@@ -603,7 +625,6 @@ def get_percentages():
 @admin_required
 def update_percentages():
     data = request.json
-    admin_user_id = session.get('user_id')
     
     try:
         provider = float(data.get('provider_percent', 60))
@@ -623,7 +644,7 @@ def update_percentages():
     setting.provider_percent = provider
     setting.admin_percent = admin
     setting.site_fee_percent = site_fee
-    setting.updated_by = admin_user_id
+    setting.updated_by = request.current_user.id
     db.session.commit()
     
     socketio.emit('percentages_updated', {
@@ -707,15 +728,19 @@ def login():
     if not user.is_active:
         return jsonify({'error': 'Account has been suspended'}), 401
     
-    session.clear()
-    session['user_id'] = user.id
-    session['role'] = user.role
-    session.permanent = True
+    # Generate JWT token
+    token = jwt.encode({
+        'user_id': user.id,
+        'email': user.email,
+        'role': user.role,
+        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    }, JWT_SECRET, algorithm='HS256')
     
-    print(f"✅ Login successful for user {user.email}, session: {dict(session)}")
+    print(f"✅ Login successful for user {user.email}")
     
     return jsonify({
         'message': 'Login successful',
+        'token': token,
         'user': {
             'id': user.id,
             'email': user.email,
@@ -731,9 +756,28 @@ def login():
     })
 
 @app.route('/api/auth/logout', methods=['POST'])
+@token_required
 def logout():
-    session.clear()
+    # JWT logout is client-side only - just return success
     return jsonify({'message': 'Logged out successfully'})
+
+@app.route('/api/auth/verify', methods=['GET'])
+@token_required
+def verify_token():
+    return jsonify({
+        'valid': True,
+        'user': {
+            'id': request.current_user.id,
+            'email': request.current_user.email,
+            'full_name': request.current_user.full_name,
+            'role': request.current_user.role,
+            'is_verified': request.current_user.is_verified,
+            'rating': request.current_user.rating,
+            'total_jobs': request.current_user.total_jobs,
+            'service_specialization': request.current_user.service_specialization.name if request.current_user.service_specialization else None,
+            'service_specialization_id': request.current_user.service_specialization_id
+        }
+    })
 
 @app.route('/api/auth/forgot-password', methods=['POST'])
 def forgot_password():
@@ -800,6 +844,7 @@ def reset_password():
     return jsonify({'message': 'Password reset successfully'})
 
 @app.route('/api/auth/user/<int:user_id>', methods=['GET'])
+@token_required
 def get_user(user_id):
     user = db.session.get(User, user_id)
     if not user:
@@ -820,11 +865,14 @@ def get_user(user_id):
 
 @app.route('/api/auth/update-profile/<int:user_id>', methods=['PUT'])
 @limiter.limit("10 per minute")
+@token_required
 def update_profile(user_id):
     data = request.json
     user = db.session.get(User, user_id)
     if not user:
         return jsonify({'error': 'User not found'}), 404
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify({'error': 'You can only update your own profile'}), 403
     
     if 'full_name' in data:
         user.full_name = data['full_name']
@@ -845,11 +893,14 @@ def update_profile(user_id):
 
 @app.route('/api/auth/change-password/<int:user_id>', methods=['PUT'])
 @limiter.limit("5 per minute")
+@token_required
 def change_password(user_id):
     data = request.json
     user = db.session.get(User, user_id)
     if not user:
         return jsonify({'error': 'User not found'}), 404
+    if request.current_user.id != user_id:
+        return jsonify({'error': 'You can only change your own password'}), 403
     
     if not check_password_hash(user.password, data.get('current_password')):
         return jsonify({'error': 'Current password is incorrect'}), 401
@@ -865,16 +916,10 @@ def change_password(user_id):
 
 @app.route('/api/auth/toggle-online/<int:user_id>', methods=['PUT'])
 @limiter.limit("30 per minute")
+@token_required
 def toggle_online_status(user_id):
     try:
-        session_user_id = session.get('user_id')
-        
-        print(f"🔍 Toggle online status called - URL user_id: {user_id}, Session user_id: {session_user_id}")
-        
-        if not session_user_id:
-            return jsonify({'error': 'Authentication required. Please log in.'}), 401
-        
-        if session_user_id != user_id:
+        if request.current_user.id != user_id:
             return jsonify({'error': f'You can only change your own status.'}), 403
         
         user = db.session.get(User, user_id)
@@ -904,14 +949,10 @@ def toggle_online_status(user_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/auth/delete-account', methods=['DELETE'])
+@token_required
 def delete_own_account():
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({'error': 'Authentication required'}), 401
-    
+    user_id = request.current_user.id
     user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
     
     if user.role == 'admin':
         return jsonify({'error': 'Admin accounts cannot be deleted through this endpoint'}), 403
@@ -925,8 +966,6 @@ def delete_own_account():
     
     db.session.delete(user)
     db.session.commit()
-    
-    session.clear()
     
     return jsonify({'message': 'Account deleted successfully'})
 
@@ -956,6 +995,7 @@ def notify_no_provider(request_id):
 
 @app.route('/api/upload', methods=['POST'])
 @limiter.limit("50 per hour")
+@token_required
 def upload_file():
     try:
         user_id = request.form.get('user_id')
@@ -965,6 +1005,9 @@ def upload_file():
         user = db.session.get(User, int(user_id))
         if not user:
             return jsonify({'error': 'User not found'}), 404
+        
+        if request.current_user.id != int(user_id):
+            return jsonify({'error': 'You can only upload files for yourself'}), 403
         
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
@@ -1302,6 +1345,7 @@ def create_comment():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/comments/<int:comment_id>', methods=['PUT'])
+@token_required
 def update_comment(comment_id):
     try:
         data = request.json
@@ -1310,21 +1354,11 @@ def update_comment(comment_id):
         if not comment:
             return jsonify({'error': 'Comment not found'}), 404
         
-        user_id = session.get('user_id')
-        
-        if not user_id:
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        user = db.session.get(User, user_id)
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 401
-        
-        if user.role != 'admin':
+        if request.current_user.role != 'admin':
             time_since = datetime.utcnow() - comment.created_at
             if time_since.total_seconds() > 120:
                 return jsonify({'error': 'Edit window expired (2 minutes)'}), 403
-            if comment.user_id != user.id:
+            if comment.user_id != request.current_user.id:
                 return jsonify({'error': 'You can only edit your own comments'}), 403
         
         if 'comment' in data:
@@ -1348,29 +1382,19 @@ def update_comment(comment_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/comments/<int:comment_id>', methods=['DELETE'])
+@token_required
 def delete_comment(comment_id):
     try:
-        data = request.json
         comment = db.session.get(Comment, comment_id)
         
         if not comment:
             return jsonify({'error': 'Comment not found'}), 404
         
-        user_id = session.get('user_id')
-        
-        if not user_id:
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        user = db.session.get(User, user_id)
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 401
-        
-        if user.role != 'admin':
+        if request.current_user.role != 'admin':
             time_since = datetime.utcnow() - comment.created_at
             if time_since.total_seconds() > 120:
                 return jsonify({'error': 'Delete window expired (2 minutes)'}), 403
-            if comment.user_id != user.id:
+            if comment.user_id != request.current_user.id:
                 return jsonify({'error': 'You can only delete your own comments'}), 403
         
         CommentReply.query.filter_by(comment_id=comment_id).delete()
@@ -1386,20 +1410,16 @@ def delete_comment(comment_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/comments/reply', methods=['POST'])
+@token_required
 def create_reply():
     try:
         data = request.json
-        user_id = data.get('user_id')
-        user = db.session.get(User, user_id) if user_id else None
-        
-        if not user:
-            return jsonify({'error': 'Authentication required'}), 401
         
         new_reply = CommentReply(
             comment_id=data.get('comment_id'),
-            user_id=user.id,
-            user_name=user.full_name,
-            user_role=user.role,
+            user_id=request.current_user.id,
+            user_name=request.current_user.full_name,
+            user_role=request.current_user.role,
             message=bleach.clean(data.get('message'))
         )
         db.session.add(new_reply)
@@ -1466,6 +1486,7 @@ def admin_delete_comment(comment_id):
 # ==================== SERVICE REQUEST ROUTES ====================
 
 @app.route('/api/requests', methods=['POST'])
+@token_required
 def create_request():
     try:
         data = request.json
@@ -1477,14 +1498,10 @@ def create_request():
         if not service.is_active:
             return jsonify({'error': 'Service is currently inactive'}), 400
         
-        user = db.session.get(User, data.get('user_id'))
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        customer_phone = data.get('customer_phone', user.phone)
+        customer_phone = data.get('customer_phone', request.current_user.phone)
         
         new_request = ServiceRequest(
-            user_id=data.get('user_id'),
+            user_id=request.current_user.id,
             service_id=data.get('service_id'),
             amount=service.total_price,
             provider_payout=service.provider_payout,
@@ -1500,11 +1517,11 @@ def create_request():
         db.session.add(new_request)
         db.session.commit()
         
-        create_notification(data.get('user_id'), f'📝 Your request for {service.name} has been submitted. Admin will review and assign a provider. You will pay the provider directly after service completion.', 'info', '/customer/dashboard')
+        create_notification(request.current_user.id, f'📝 Your request for {service.name} has been submitted. Admin will review and assign a provider. You will pay the provider directly after service completion.', 'info', '/customer/dashboard')
         
         socketio.emit('new_request', {
             'id': new_request.id,
-            'customer_name': user.full_name,
+            'customer_name': request.current_user.full_name,
             'service_name': service.name,
             'amount': service.total_price,
             'created_at': new_request.created_at.isoformat()
@@ -1514,7 +1531,7 @@ def create_request():
             'request_id': new_request.id,
             'service_name': service.name,
             'status': 'pending_approval'
-        }, room=f"user_{user.id}")
+        }, room=f"user_{request.current_user.id}")
         
         return jsonify({'message': 'Request submitted successfully! Admin will review and assign a provider. Payment will be made directly to the provider.', 'request_id': new_request.id, 'amount': service.total_price})
     
@@ -1524,11 +1541,11 @@ def create_request():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/requests/user/<int:user_id>', methods=['GET'])
+@token_required
 def get_user_requests(user_id):
     try:
-        user = db.session.get(User, user_id)
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
+        if request.current_user.id != user_id and request.current_user.role != 'admin':
+            return jsonify({'error': 'Unauthorized'}), 403
         
         requests = ServiceRequest.query.filter_by(user_id=user_id).order_by(ServiceRequest.created_at.desc()).all()
         result = []
@@ -1632,6 +1649,7 @@ def approve_and_assign_request(request_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/requests/<int:request_id>/provider-complete', methods=['PUT'])
+@token_required
 def provider_complete_request(request_id):
     try:
         print(f"📝 Provider complete request for ID: {request_id}")
@@ -1639,6 +1657,9 @@ def provider_complete_request(request_id):
         service_request = db.session.get(ServiceRequest, request_id)
         if not service_request:
             return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.provider_id != request.current_user.id:
+            return jsonify({'error': 'You can only complete your own jobs'}), 403
         
         if service_request.status != 'assigned' and service_request.status != 'in_progress':
             return jsonify({'error': f'Cannot complete. Service status: {service_request.status}. Expected: assigned or in_progress'}), 400
@@ -1679,6 +1700,7 @@ def provider_complete_request(request_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/requests/<int:request_id>/confirm', methods=['PUT'])
+@token_required
 def confirm_request_completion(request_id):
     try:
         print(f"📝 Confirm completion request for ID: {request_id}")
@@ -1686,6 +1708,9 @@ def confirm_request_completion(request_id):
         service_request = db.session.get(ServiceRequest, request_id)
         if not service_request:
             return jsonify({'error': 'Request not found'}), 404
+        
+        if service_request.user_id != request.current_user.id:
+            return jsonify({'error': 'You can only confirm your own requests'}), 403
         
         if not service_request.provider_completed:
             return jsonify({'error': 'Provider has not marked service as completed yet.'}), 400
@@ -1725,11 +1750,15 @@ def confirm_request_completion(request_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/requests/<int:request_id>/rate', methods=['POST'])
+@token_required
 def rate_request(request_id):
     data = request.json
     service_request = db.session.get(ServiceRequest, request_id)
     if not service_request:
         return jsonify({'error': 'Request not found'}), 404
+    
+    if service_request.user_id != request.current_user.id:
+        return jsonify({'error': 'You can only rate your own requests'}), 403
     
     service_request.rating = data.get('rating')
     db.session.commit()
@@ -1755,24 +1784,21 @@ def rate_request(request_id):
     return jsonify({'message': 'Rating submitted'})
 
 # ==================== JOB/PROVIDER ROUTES ====================
+
 @app.route('/api/jobs/available', methods=['GET'])
+@token_required
 def get_available_jobs():
-    user_id = session.get('user_id')
-    if not user_id:
+    if request.current_user.role != 'provider':
         return jsonify([])
     
-    provider = db.session.get(User, user_id)
-    if not provider or provider.role != 'provider':
-        return jsonify([])
-    
-    if not provider.is_verified:
+    if not request.current_user.is_verified:
         return jsonify([])
     
     # ONLY show jobs where THIS SPECIFIC provider is assigned
     available_jobs = ServiceRequest.query.filter(
         ServiceRequest.status == 'pending_approval',
-        ServiceRequest.provider_id == provider.id,
-        ServiceRequest.service_id == provider.service_specialization_id
+        ServiceRequest.provider_id == request.current_user.id,
+        ServiceRequest.service_id == request.current_user.service_specialization_id
     ).all()
     
     return jsonify([{
@@ -1788,39 +1814,38 @@ def get_available_jobs():
         'provider_payout': req.provider_payout
     } for req in available_jobs])
 
-
 @app.route('/api/jobs/claim', methods=['POST'])
+@token_required
 def claim_job():
     data = request.json
     service_request = db.session.get(ServiceRequest, data.get('request_id'))
     if not service_request:
         return jsonify({'error': 'Request not found'}), 404
     
-    if service_request.provider_id:
-        return jsonify({'error': 'Job already claimed'}), 400
+    if service_request.provider_id and service_request.provider_id != request.current_user.id:
+        return jsonify({'error': 'Job already claimed by another provider'}), 400
     
-    provider = db.session.get(User, data.get('provider_id'))
-    if not provider or provider.role != 'provider' or not provider.is_verified:
+    if request.current_user.role != 'provider' or not request.current_user.is_verified:
         return jsonify({'error': 'Invalid or unverified provider'}), 400
     
-    if provider.service_specialization_id != service_request.service_id:
+    if request.current_user.service_specialization_id != service_request.service_id:
         service = db.session.get(Service, service_request.service_id)
-        provider_service = db.session.get(Service, provider.service_specialization_id)
         return jsonify({
-            'error': f'You specialize in {provider_service.name if provider_service else "unknown service"}, not {service.name if service else "this service"}. You can only claim jobs matching your specialization.'
+            'error': f'You specialize in {request.current_user.service_specialization.name if request.current_user.service_specialization else "unknown service"}, not {service.name if service else "this service"}.'
         }), 400
     
-    service_request.provider_id = provider.id
+    service_request.provider_id = request.current_user.id
     service_request.status = 'in_progress'
-    provider.total_jobs = (provider.total_jobs or 0) + 1
+    service_request.assigned_at = datetime.utcnow()
+    request.current_user.total_jobs = (request.current_user.total_jobs or 0) + 1
     db.session.commit()
     
-    create_notification(service_request.user_id, f'✅ Provider {provider.full_name} has started working on your {service_request.service.name} request.', 'success', '/customer/dashboard')
-    create_notification(provider.id, f'🔔 You have claimed a new job: {service_request.service.name} for {service_request.user.full_name}', 'job', '/provider/dashboard')
+    create_notification(service_request.user_id, f'✅ Provider {request.current_user.full_name} has started working on your {service_request.service.name} request.', 'success', '/customer/dashboard')
+    create_notification(request.current_user.id, f'🔔 You have claimed a new job: {service_request.service.name} for {service_request.user.full_name}', 'job', '/provider/dashboard')
     
     socketio.emit('job_claimed', {
         'request_id': service_request.id,
-        'provider_id': provider.id,
+        'provider_id': request.current_user.id,
         'customer_id': service_request.user_id
     })
     
@@ -1828,13 +1853,17 @@ def claim_job():
         'request_id': service_request.id,
         'status': 'in_progress',
         'user_id': service_request.user_id,
-        'provider_id': provider.id
+        'provider_id': request.current_user.id
     })
     
     return jsonify({'message': 'Job claimed successfully'})
 
 @app.route('/api/jobs/provider/<int:provider_id>', methods=['GET'])
+@token_required
 def get_provider_jobs(provider_id):
+    if request.current_user.id != provider_id and request.current_user.role != 'admin':
+        return jsonify([])
+    
     jobs = ServiceRequest.query.filter_by(provider_id=provider_id).order_by(ServiceRequest.created_at.desc()).all()
     return jsonify([{
         'id': j.id,
@@ -1855,11 +1884,15 @@ def get_provider_jobs(provider_id):
     } for j in jobs])
 
 @app.route('/api/jobs/<int:job_id>/status', methods=['PUT'])
+@token_required
 def update_job_status(job_id):
     data = request.json
     service_request = db.session.get(ServiceRequest, job_id)
     if not service_request:
         return jsonify({'error': 'Job not found'}), 404
+    
+    if service_request.provider_id != request.current_user.id:
+        return jsonify({'error': 'You can only update your own jobs'}), 403
     
     new_status = data.get('status')
     if new_status == 'in_progress':
@@ -1884,8 +1917,11 @@ def update_job_status(job_id):
 # ==================== NOTIFICATION ROUTES ====================
 
 @app.route('/api/notifications/<int:user_id>', methods=['GET'])
-@limiter.exempt
+@token_required
 def get_notifications(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify([])
+    
     notifications = Notification.query.filter_by(user_id=user_id).order_by(Notification.created_at.desc()).limit(100).all()
     return jsonify([{
         'id': n.id,
@@ -1897,34 +1933,46 @@ def get_notifications(user_id):
     } for n in notifications])
 
 @app.route('/api/notifications/<int:notification_id>/read', methods=['PUT'])
+@token_required
 def mark_notification_read(notification_id):
     notification = db.session.get(Notification, notification_id)
-    if notification:
+    if notification and notification.user_id == request.current_user.id:
         notification.read = True
         db.session.commit()
     return jsonify({'message': 'Marked as read'})
 
 @app.route('/api/notifications/read-all/<int:user_id>', methods=['PUT'])
+@token_required
 def mark_all_notifications_read_route(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
     count = mark_all_notifications_read(user_id)
     return jsonify({'message': f'{count} notifications marked as read'})
 
 @app.route('/api/notifications/delete-all/<int:user_id>', methods=['DELETE'])
+@token_required
 def delete_all_notifications_route(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
     count = delete_all_notifications(user_id)
     return jsonify({'message': f'{count} notifications deleted'})
 
 @app.route('/api/notifications/unread-count/<int:user_id>', methods=['GET'])
-@limiter.exempt
+@token_required
 def get_unread_count(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify({'count': 0})
     count = Notification.query.filter_by(user_id=user_id, read=False).count()
     return jsonify({'count': count})
 
 @app.route('/api/notifications/<int:notification_id>', methods=['DELETE'])
+@token_required
 def delete_notification(notification_id):
     notification = db.session.get(Notification, notification_id)
     if not notification:
         return jsonify({'error': 'Notification not found'}), 404
+    if notification.user_id != request.current_user.id and request.current_user.role != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
     db.session.delete(notification)
     db.session.commit()
     return jsonify({'message': 'Notification deleted'})
@@ -1932,9 +1980,10 @@ def delete_notification(notification_id):
 # ==================== MESSAGING ROUTES ====================
 
 @app.route('/api/messages', methods=['POST'])
+@token_required
 def send_message():
     data = request.json
-    sender_id = data.get('sender_id')
+    sender_id = request.current_user.id
     receiver_id = data.get('receiver_id')
     subject = data.get('subject', '')
     message_text = data.get('message')
@@ -1946,19 +1995,18 @@ def send_message():
     if not message_text and not attachment_path:
         return jsonify({'error': 'Message cannot be empty'}), 400
     
-    sender = db.session.get(User, sender_id)
     receiver = db.session.get(User, receiver_id)
     
-    if not sender or not receiver:
+    if not receiver:
         return jsonify({'error': 'User not found'}), 404
     
-    if sender.role == 'customer' and receiver.role == 'customer':
+    if request.current_user.role == 'customer' and receiver.role == 'customer':
         return jsonify({'error': 'Customers cannot message other customers'}), 403
     
-    if sender.role == 'provider' and receiver.role == 'provider':
+    if request.current_user.role == 'provider' and receiver.role == 'provider':
         return jsonify({'error': 'Providers cannot message other providers'}), 403
     
-    if sender.role == 'customer' and receiver.role == 'provider':
+    if request.current_user.role == 'customer' and receiver.role == 'provider':
         assigned_job = ServiceRequest.query.filter(
             ServiceRequest.provider_id == receiver_id, 
             ServiceRequest.user_id == sender_id,
@@ -1967,7 +2015,7 @@ def send_message():
         if not assigned_job:
             return jsonify({'error': 'You can only message providers assigned to your active or completed jobs'}), 403
     
-    if sender.role == 'provider' and receiver.role == 'customer':
+    if request.current_user.role == 'provider' and receiver.role == 'customer':
         assigned_job = ServiceRequest.query.filter(
             ServiceRequest.provider_id == sender_id, 
             ServiceRequest.user_id == receiver_id,
@@ -1989,12 +2037,12 @@ def send_message():
     db.session.add(new_message)
     db.session.commit()
     
-    create_notification(receiver_id, f'📩 New message from {sender.full_name}', 'message', '/messages')
+    create_notification(receiver_id, f'📩 New message from {request.current_user.full_name}', 'message', '/messages')
     
     socketio.emit('new_message', {
         'id': new_message.id,
         'sender_id': sender_id,
-        'sender_name': sender.full_name,
+        'sender_name': request.current_user.full_name,
         'receiver_id': receiver_id,
         'message': new_message.message,
         'attachment_path': attachment_path,
@@ -2007,31 +2055,27 @@ def send_message():
     return jsonify({'message': 'Message sent', 'id': new_message.id})
 
 @app.route('/api/messages/<int:message_id>', methods=['DELETE'])
+@token_required
 def delete_message(message_id):
     try:
         data = request.json
-        user_id = data.get('user_id') if data else None
         delete_for_everyone = data.get('delete_for_everyone', False)
         
         message = db.session.get(Message, message_id)
         if not message:
             return jsonify({'error': 'Message not found'}), 404
         
-        user = db.session.get(User, user_id)
-        if not user:
-            return jsonify({'error': 'User not found'}), 401
-        
         if delete_for_everyone:
             time_since = datetime.utcnow() - message.created_at
             if time_since.total_seconds() > 300:
                 return jsonify({'error': 'Delete for everyone only available within 5 minutes of sending'}), 403
-            if message.sender_id != user_id:
+            if message.sender_id != request.current_user.id:
                 return jsonify({'error': 'Only the sender can delete for everyone'}), 403
             db.session.delete(message)
         else:
-            if user_id == message.sender_id:
+            if request.current_user.id == message.sender_id:
                 message.is_deleted_for_sender = True
-            elif user_id == message.receiver_id:
+            elif request.current_user.id == message.receiver_id:
                 message.is_deleted_for_receiver = True
             else:
                 return jsonify({'error': 'You can only delete your own messages'}), 403
@@ -2045,10 +2089,10 @@ def delete_message(message_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/messages/<int:message_id>/edit', methods=['PUT'])
+@token_required
 def edit_message(message_id):
     try:
         data = request.json
-        user_id = data.get('user_id')
         new_message_text = data.get('message')
         
         if not new_message_text:
@@ -2058,7 +2102,7 @@ def edit_message(message_id):
         if not message:
             return jsonify({'error': 'Message not found'}), 404
         
-        if message.sender_id != user_id:
+        if message.sender_id != request.current_user.id:
             return jsonify({'error': 'You can only edit your own messages'}), 403
         
         time_since = datetime.utcnow() - message.created_at
@@ -2084,7 +2128,11 @@ def edit_message(message_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/messages/user/<int:user_id>', methods=['GET'])
+@token_required
 def get_user_messages(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify([])
+    
     messages = Message.query.filter(
         ((Message.sender_id == user_id) | (Message.receiver_id == user_id)),
         Message.is_deleted_for_sender == False,
@@ -2112,9 +2160,10 @@ def get_user_messages(user_id):
     } for m in messages])
 
 @app.route('/api/messages/<int:message_id>/read', methods=['PUT'])
+@token_required
 def mark_message_read(message_id):
     message = db.session.get(Message, message_id)
-    if message:
+    if message and message.receiver_id == request.current_user.id:
         message.is_read = True
         message.read_at = datetime.utcnow()
         db.session.commit()
@@ -2127,12 +2176,19 @@ def mark_message_read(message_id):
     return jsonify({'message': 'Message marked as read'})
 
 @app.route('/api/messages/unread/<int:user_id>', methods=['GET'])
+@token_required
 def get_unread_messages_count(user_id):
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify({'count': 0})
     count = Message.query.filter_by(receiver_id=user_id, is_read=False).count()
     return jsonify({'count': count})
 
 @app.route('/api/messages/conversation/<int:user1>/<int:user2>', methods=['GET'])
+@token_required
 def get_conversation(user1, user2):
+    if request.current_user.id != user1 and request.current_user.id != user2 and request.current_user.role != 'admin':
+        return jsonify([])
+    
     messages = Message.query.filter(
         ((Message.sender_id == user1) & (Message.receiver_id == user2)) |
         ((Message.sender_id == user2) & (Message.receiver_id == user1)),
@@ -2163,11 +2219,12 @@ def get_conversation(user1, user2):
 # ==================== CONTACTS ROUTE ====================
 
 @app.route('/api/contacts/<int:user_id>', methods=['GET'])
+@token_required
 def get_contacts(user_id):
-    current_user = db.session.get(User, user_id)
-    if not current_user:
-        return jsonify({'error': 'User not found'}), 404
+    if request.current_user.id != user_id and request.current_user.role != 'admin':
+        return jsonify([])
     
+    current_user = request.current_user
     contacts = []
     all_users = User.query.filter(User.id != user_id).all()
     
@@ -2636,12 +2693,9 @@ def update_payment_settings():
 # ==================== SESSION KEEP ALIVE ====================
 
 @app.route('/api/auth/ping', methods=['GET'])
+@token_required
 def ping():
-    user_id = session.get('user_id')
-    if user_id:
-        session.permanent = True
-        return jsonify({'message': 'session active', 'user_id': user_id})
-    return jsonify({'message': 'no session'}), 401
+    return jsonify({'message': 'session active', 'user_id': request.current_user.id})
 
 # ==================== INITIAL DATA ====================
 
@@ -2732,7 +2786,7 @@ def init_db():
             db.session.add(service)
             created_services.append(service)
     
-        admin = User.query.filter_by(email='admin@zivre.com').first()
+    admin = User.query.filter_by(email='admin@zivre.com').first()
     if not admin:
         admin = User(
             email='admin@zivre.com',
@@ -2745,14 +2799,11 @@ def init_db():
         )
         db.session.add(admin)
     else:
-        # Ensure admin is active and password is correct
         admin.is_active = True
         admin.is_verified = True
         if not check_password_hash(admin.password, 'Admin123!'):
             admin.password = generate_password_hash('Admin123!')
         db.session.add(admin)
-
-        
     
     hvac_service = Service.query.filter_by(name='HVAC Systems').first()
     
@@ -2800,25 +2851,15 @@ def init_db():
 with app.app_context():
     init_db()
 
-
-
 @app.route('/api/debug/session', methods=['GET'])
+@token_required
 def debug_session():
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({'error': 'No user in session'}), 401
-    
-    user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
     return jsonify({
-        'session_user_id': user_id,
-        'db_user_id': user.id,
-        'email': user.email,
-        'role': user.role,
-        'is_active': user.is_active,
-        'is_verified': user.is_verified
+        'session_user_id': request.current_user.id,
+        'email': request.current_user.email,
+        'role': request.current_user.role,
+        'is_active': request.current_user.is_active,
+        'is_verified': request.current_user.is_verified
     })
     
 # ==================== RUN THE APP ====================
