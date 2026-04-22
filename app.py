@@ -1835,7 +1835,7 @@ def claim_job():
         }), 400
     
     service_request.provider_id = request.current_user.id
-    service_request.status = 'in_progress'
+    service_request.status = 'assigned'
     service_request.assigned_at = datetime.utcnow()
     request.current_user.total_jobs = (request.current_user.total_jobs or 0) + 1
     db.session.commit()
