@@ -748,8 +748,7 @@ def calculate_commission(referral_pool, level):
     return round(commission, 2) if commission >= 0.01 else 0
 
 def process_referral_commissions(booking, customer):
-    self_bonus = 0  # ← ADD THIS LINE
-    # Check if commissions already processed for this booking
+    self_bonus = 0  
     if booking.commissions_processed:
         return {'already_processed': True, 'total_commissions': booking.total_commissions_paid}
     
@@ -847,6 +846,50 @@ def process_referral_commissions(booking, customer):
     }
 # ==================== AUTH ROUTES ====================
   # ==================== AUTH ROUTES ====================
+@app.route('/api/auth/login', methods=['POST'])
+@limiter.limit("10 per minute")
+def login():
+    data = request.json
+    user = User.query.filter_by(email=data.get('email')).first()
+    
+    if not user or not check_password_hash(user.password, data.get('password')):
+        return jsonify({'error': 'Invalid email or password'}), 401
+    
+    if not user.is_active:
+        return jsonify({'error': 'Account has been suspended'}), 401
+    
+    # Generate JWT token
+    token = jwt.encode({
+        'user_id': user.id,
+        'email': user.email,
+        'role': user.role,
+        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    }, JWT_SECRET, algorithm='HS256')
+    
+    print(f"✅ Login successful for user {user.email}")
+    
+    return jsonify({
+        'message': 'Login successful',
+        'token': token,
+        'user': {
+            'id': user.id,
+            'email': user.email,
+            'full_name': user.full_name,
+            'phone': user.phone,
+            'role': user.role,
+            'is_verified': user.is_verified,
+            'rating': user.rating,
+            'total_jobs': user.total_jobs,
+            'service_specialization': user.service_specialization.name if user.service_specialization else None,
+            'service_specialization_id': user.service_specialization_id,
+            'referral_code': user.referral_code,
+            'commission_balance': float(user.commission_balance or 0),
+            'total_earned': float(user.total_earned or 0),
+            'is_referral_active': user.is_referral_active
+        }
+    })
+
+
 
 @app.route('/api/auth/signup', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -928,115 +971,12 @@ def signup():
             'role': new_user.role,
             'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None,
             'referral_code': new_user.referral_code,
-            'is_referral_active': new_user.is_referral_active,
+            'is_referral_active': new_user.is_referral_active,  # ← FIXED: was 'is_active'
             'commission_balance': float(new_user.commission_balance or 0)
         }
     })
-
-
-def login():
-    data = request.json
-    user = User.query.filter_by(email=data.get('email')).first()
-    
-    if not user or not check_password_hash(user.password, data.get('password')):
-        return jsonify({'error': 'Invalid email or password'}), 401
-    
-    if not user.is_active:
-        return jsonify({'error': 'Account has been suspended'}), 401
-    
-    # Generate JWT token
-    token = jwt.encode({
-        'user_id': user.id,
-        'email': user.email,
-        'role': user.role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    }, JWT_SECRET, algorithm='HS256')
-    
-    print(f"✅ Login successful for user {user.email}")
-    
-    return jsonify({
-        'message': 'Login successful',
-        'token': token,
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'full_name': user.full_name,
-            'phone': user.phone,
-            'role': user.role,
-            'is_verified': user.is_verified,
-            'rating': user.rating,
-            'total_jobs': user.total_jobs,
-            'service_specialization': user.service_specialization.name if user.service_specialization else None,
-            'service_specialization_id': user.service_specialization_id,
-            # ========== ADD THESE REFERRAL FIELDS ==========
-            'referral_code': user.referral_code,
-            'commission_balance': float(user.commission_balance or 0),
-            'total_earned': float(user.total_earned or 0),
-            'is_referral_active': user.is_referral_active
-            # ===============================================
-        }
-    })
-    
-    referrer_id = None
-    position = None
-    referral_code_input = data.get('referral_code')
-    
-    if referral_code_input:
-        referrer = User.query.filter_by(referral_code=referral_code_input).first()
-        if referrer:
-            referrer_id = referrer.id
-            children_count = User.query.filter_by(referrer_id=referrer.id).count()
-            if children_count == 0:
-                position = 'left'
-            elif children_count == 1:
-                position = 'center'
-            elif children_count == 2:
-                position = 'right'
-            else:
-                return jsonify({'error': 'This referrer already has maximum children (3)'}), 400
-    
-    # ========== CREATE NEW USER ==========
-    new_user = User(
-        email=data.get('email'),
-        password=hashed_password,
-        full_name=data.get('full_name'),
-        phone=data.get('phone'),
-        role=data.get('role', 'customer'),
-        service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
-        is_verified=False if data.get('role') == 'provider' else True,
-        is_referral_active=False,
-        referral_code=generate_referral_code(),
-        referrer_id=referrer_id,
-        position=position
-    )
-    
-    db.session.add(new_user)
-    db.session.commit()
-    
-    # Generate JWT token for auto-login
-    token = jwt.encode({
-        'user_id': new_user.id,
-        'email': new_user.email,
-        'role': new_user.role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    }, JWT_SECRET, algorithm='HS256')
-    
-    return jsonify({
-        'message': 'User created successfully',
-        'token': token,
-        'user': {
-            'id': new_user.id,
-            'email': new_user.email,
-            'full_name': new_user.full_name,
-            'role': new_user.role,
-            'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None,
-            'referral_code': new_user.referral_code,
-            'is_active': new_user.is_active,
-            'commission_balance': float(new_user.commission_balance or 0)
-        }
-    })
-
-    
+    # ← DELETE everything after this line (the duplicate code)
+   
 
 
 @app.route('/api/auth/logout', methods=['POST'])
