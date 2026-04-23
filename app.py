@@ -753,17 +753,14 @@ def process_referral_commissions(booking, customer):
     if booking.commissions_processed:
         return {'already_processed': True, 'total_commissions': booking.total_commissions_paid}
     
-    # Get service to get share percentages
     service = db.session.get(Service, booking.service_id)
     if not service:
         return {'error': 'Service not found'}
     
-    # Calculate referral pool (admin share + website share)
     admin_share = service.admin_share_percent or 10.0
     website_share = service.website_share_percent or 10.0
     referral_pool = booking.amount * (admin_share + website_share) / 100
     
-    # Store snapshot in booking
     booking.referral_pool_amount = referral_pool
     booking.admin_share_percent_snapshot = admin_share
     booking.website_share_percent_snapshot = website_share
@@ -771,18 +768,17 @@ def process_referral_commissions(booking, customer):
     
     total_commissions = 0
     level = 1
-    current_user = customer
     
-    # FIX 1: Count completed bookings EXCLUDING current one
+    # Count completed bookings EXCLUDING current one
     user_completed_bookings = ServiceRequest.query.filter(
         ServiceRequest.user_id == customer.id,
         ServiceRequest.status == 'confirmed',
         ServiceRequest.id != booking.id
     ).count()
     
-    # First booking? Give self-bonus (20% of referral pool)
+    # FIX #1: Self-bonus = 5% (not 20%)
     if user_completed_bookings == 0:
-        self_bonus = referral_pool * 0.20
+        self_bonus = referral_pool * 0.05  # 5%
         if self_bonus >= 0.01:
             customer.commission_balance = (customer.commission_balance or 0) + self_bonus
             customer.total_earned = (customer.total_earned or 0) + self_bonus
@@ -796,18 +792,18 @@ def process_referral_commissions(booking, customer):
             )
             db.session.add(new_commission)
         
-        # Activate user after first completed booking
+        # PATH A: User becomes ACTIVE by doing their own service
         customer.is_referral_active = True
     
-    # Process referral chain - FIX 2 & 3: Don't skip inactive referrers
+    # Process referral chain
     current_user = customer
     while current_user and current_user.referrer_id and level <= MAX_REFERRAL_DEPTH:
         referrer = db.session.get(User, current_user.referrer_id)
         if not referrer:
             break
         
-        # FIX 2: REMOVED the "skip inactive referrers" block
-        # Old code that was here is GONE
+        # FIX #2: DELETED the skip inactive referrers block
+        # Inactive referrers NOW earn commissions
         
         commission = calculate_commission(referral_pool, level)
         
@@ -818,8 +814,9 @@ def process_referral_commissions(booking, customer):
         referrer.total_earned = (referrer.total_earned or 0) + commission
         total_commissions += commission
         
-        # FIX 3: Activate referrer when they earn
-        referrer.is_referral_active = True
+        # PATH B: User becomes ACTIVE by earning from referral
+        if not referrer.is_referral_active:
+            referrer.is_referral_active = True
         
         new_commission = Commission(
             booking_id=booking.id,
@@ -832,7 +829,6 @@ def process_referral_commissions(booking, customer):
         level += 1
         current_user = referrer
     
-    # Calculate owner net (platform profit)
     booking.total_commissions_paid = total_commissions
     booking.owner_net = referral_pool - total_commissions
     booking.commissions_processed = True
@@ -847,6 +843,8 @@ def process_referral_commissions(booking, customer):
         'levels_processed': level - 1,
         'self_bonus': self_bonus if user_completed_bookings == 0 else 0
     }
+
+    
 # ==================== AUTH ROUTES ====================
   # ==================== AUTH ROUTES ====================
 @app.route('/api/auth/login', methods=['POST'])
