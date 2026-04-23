@@ -3183,10 +3183,19 @@ def init_db():
             service_specialization_id=hvac_service.id if hvac_service else None
         )
         db.session.add(sample_provider)
+        print("✅ Created new test provider")
     else:
+        # FIX: Update existing provider with correct credentials
+        sample_provider.is_verified = True
+        sample_provider.is_active = True
         if hvac_service:
             sample_provider.service_specialization_id = hvac_service.id
-            db.session.add(sample_provider)
+        # FORCE reset password to ensure it's correct
+        sample_provider.password = generate_password_hash('Provider123!')
+        db.session.add(sample_provider)
+        print("✅ Updated existing test provider with correct password")
+    
+    db.session.commit()
     
     payment_number = SystemSetting.query.filter_by(key='payment_number').first()
     if not payment_number:
