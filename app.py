@@ -3448,6 +3448,17 @@ def request_withdrawal():
     data = request.json
     user = request.current_user
     
+    # Check if user has any pending or admin_sent withdrawal
+    pending_withdrawal = WithdrawalRequest.query.filter(
+        WithdrawalRequest.user_id == user.id,
+        WithdrawalRequest.status.in_(['pending', 'admin_sent'])
+    ).first()
+    
+    if pending_withdrawal:
+        return jsonify({
+            'error': f'You have a withdrawal with status "{pending_withdrawal.status}". Please confirm or wait for processing before requesting a new withdrawal.'
+        }), 400
+    
     amount = data.get('amount', 0)
     payment_method = data.get('payment_method')
     account_details = data.get('account_details')
@@ -3461,9 +3472,7 @@ def request_withdrawal():
     if not payment_method or not account_details:
         return jsonify({'error': 'Payment method and account details are required'}), 400
     
-    # Deduct balance immediately
-    user.commission_balance = (user.commission_balance or 0) - amount
-    
+    # DO NOT deduct balance here - deduct only when user confirms receipt
     withdrawal = WithdrawalRequest(
         user_id=user.id,
         amount=amount,
@@ -3488,7 +3497,7 @@ def request_withdrawal():
     return jsonify({
         'message': 'Withdrawal request submitted successfully',
         'withdrawal_id': withdrawal.id,
-        'new_balance': float(user.commission_balance)
+        'new_balance': float(user.commission_balance)  # Balance unchanged
     })
 
 @app.route('/api/referrals/withdrawal-history', methods=['GET'])
@@ -3563,6 +3572,7 @@ def get_pending_withdrawals():
         'requested_at': w.requested_at.isoformat()
     } for w in withdrawals])
 
+
 @app.route('/api/admin/referrals/withdrawals/<int:withdrawal_id>/mark-sent', methods=['PUT'])
 @admin_required
 def mark_withdrawal_sent(withdrawal_id):
@@ -3576,6 +3586,7 @@ def mark_withdrawal_sent(withdrawal_id):
     if withdrawal.status != 'pending':
         return jsonify({'error': f'Withdrawal already {withdrawal.status}'}), 400
     
+    # DO NOT deduct balance here - balance is still with user
     withdrawal.status = 'admin_sent'
     withdrawal.admin_processed_at = datetime.utcnow()
     withdrawal.admin_notes = notes
@@ -3590,7 +3601,7 @@ def mark_withdrawal_sent(withdrawal_id):
     )
     
     return jsonify({'message': 'Withdrawal marked as sent', 'status': 'admin_sent'})
-
+    
 @app.route('/api/referrals/withdrawals/<int:withdrawal_id>/confirm', methods=['PUT'])
 @token_required
 def confirm_withdrawal_receipt(withdrawal_id):
@@ -3605,12 +3616,24 @@ def confirm_withdrawal_receipt(withdrawal_id):
     if withdrawal.status != 'admin_sent':
         return jsonify({'error': f'Cannot confirm. Current status: {withdrawal.status}'}), 400
     
+    # Deduct balance ONLY when user confirms receipt
+    user = request.current_user
+    if user.commission_balance >= withdrawal.amount:
+        user.commission_balance = (user.commission_balance or 0) - withdrawal.amount
+    else:
+        return jsonify({'error': 'Insufficient balance for confirmation'}), 400
+    
     withdrawal.status = 'user_confirmed'
     withdrawal.user_confirmed_at = datetime.utcnow()
     
     db.session.commit()
     
-    return jsonify({'message': 'Withdrawal confirmed successfully', 'status': 'user_confirmed'})
+    return jsonify({
+        'message': 'Withdrawal confirmed successfully',
+        'status': 'user_confirmed',
+        'new_balance': float(user.commission_balance)
+    })
+
 
 @app.route('/api/admin/referrals/owner-net-summary', methods=['GET'])
 @admin_required
