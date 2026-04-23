@@ -747,6 +747,7 @@ def calculate_commission(referral_pool, level):
     commission = referral_pool * rate
     return round(commission, 2) if commission >= 0.01 else 0
 
+
 def process_referral_commissions(booking, customer):
     self_bonus = 0  
     if booking.commissions_processed:
@@ -772,10 +773,11 @@ def process_referral_commissions(booking, customer):
     level = 1
     current_user = customer
     
-    # Check if this is customer's first completed booking
-    user_completed_bookings = ServiceRequest.query.filter_by(
-        user_id=customer.id, 
-        status='confirmed'
+    # FIX 1: Count completed bookings EXCLUDING current one
+    user_completed_bookings = ServiceRequest.query.filter(
+        ServiceRequest.user_id == customer.id,
+        ServiceRequest.status == 'confirmed',
+        ServiceRequest.id != booking.id
     ).count()
     
     # First booking? Give self-bonus (20% of referral pool)
@@ -797,17 +799,15 @@ def process_referral_commissions(booking, customer):
         # Activate user after first completed booking
         customer.is_referral_active = True
     
-    # Process referral chain
+    # Process referral chain - FIX 2 & 3: Don't skip inactive referrers
     current_user = customer
     while current_user and current_user.referrer_id and level <= MAX_REFERRAL_DEPTH:
         referrer = db.session.get(User, current_user.referrer_id)
         if not referrer:
             break
         
-        # Skip inactive referrers (they don't earn until active)
-        if not referrer.is_referral_active:
-            current_user = referrer
-            continue
+        # FIX 2: REMOVED the "skip inactive referrers" block
+        # Old code that was here is GONE
         
         commission = calculate_commission(referral_pool, level)
         
@@ -817,6 +817,9 @@ def process_referral_commissions(booking, customer):
         referrer.commission_balance = (referrer.commission_balance or 0) + commission
         referrer.total_earned = (referrer.total_earned or 0) + commission
         total_commissions += commission
+        
+        # FIX 3: Activate referrer when they earn
+        referrer.is_referral_active = True
         
         new_commission = Commission(
             booking_id=booking.id,
