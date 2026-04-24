@@ -717,6 +717,24 @@ def update_percentages():
     setting.referral_pool_percent = referral_pool
     setting.updated_by = request.current_user.id
     db.session.commit()
+
+        db.session.commit()
+    
+    # ========== AUTO-RECALCULATE ALL EXISTING SERVICES ==========
+    try:
+        all_services = Service.query.all()
+        updated_count = 0
+        for service in all_services:
+            service.provider_payout = service.total_price * (provider / 100)
+            service.admin_fee = service.total_price * (admin / 100)
+            service.site_fee = service.total_price * (site_fee / 100)
+            service.referral_pool_amount = service.total_price * (referral_pool / 100)
+            updated_count += 1
+        db.session.commit()
+        print(f"✅ Auto-recalculated {updated_count} services with new percentages")
+    except Exception as e:
+        print(f"⚠️ Service recalculation error: {e}")
+        # Don't fail - percentages were already saved
     
     socketio.emit('percentages_updated', {
         'provider_percent': provider,
