@@ -194,11 +194,11 @@ class Service(db.Model):
     is_active = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
-    # ========== ADD THESE REFERRAL COLUMNS ==========
+    # Referral columns
     admin_share_percent = db.Column(db.Float, default=10.0)
     website_share_percent = db.Column(db.Float, default=10.0)
     provider_share_percent = db.Column(db.Float, default=80.0)
-    # ===============================================
+    referral_pool_percent = db.Column(db.Float, default=10.0)
 
 
 
@@ -246,7 +246,7 @@ class ServiceRequest(db.Model):
     website_share_percent_snapshot = db.Column(db.Float, default=10.0)
     provider_share_percent_snapshot = db.Column(db.Float, default=80.0)
     commissions_processed = db.Column(db.Boolean, default=False)
-    # ===============================================
+    referral_pool_percent_snapshot = db.Column(db.Float, default=10.0)  # <-- NEW
     
     user = db.relationship('User', foreign_keys=[user_id])
     service = db.relationship('Service')
@@ -757,14 +757,18 @@ def process_referral_commissions(booking, customer):
     if not service:
         return {'error': 'Service not found'}
     
-    admin_share = service.admin_share_percent or 10.0
-    website_share = service.website_share_percent or 10.0
-    referral_pool = booking.amount * (admin_share + website_share) / 100
+    # Get the separate referral pool percentage
+    referral_pool_percent = service.referral_pool_percent or 10.0
     
+    # Calculate referral pool amount from booking amount
+    referral_pool = booking.amount * referral_pool_percent / 100
+    
+    # Store snapshots
     booking.referral_pool_amount = referral_pool
-    booking.admin_share_percent_snapshot = admin_share
-    booking.website_share_percent_snapshot = website_share
+    booking.admin_share_percent_snapshot = service.admin_share_percent or 10.0
+    booking.website_share_percent_snapshot = service.website_share_percent or 10.0
     booking.provider_share_percent_snapshot = service.provider_share_percent or 80.0
+    booking.referral_pool_percent_snapshot = referral_pool_percent
     
     total_commissions = 0
     level = 1
@@ -776,9 +780,9 @@ def process_referral_commissions(booking, customer):
         ServiceRequest.id != booking.id
     ).count()
     
-    # FIX #1: Self-bonus = 5% (not 20%)
+    # Self-bonus for first booking (5% of referral pool)
     if user_completed_bookings == 0:
-        self_bonus = referral_pool * 0.05  # 5%
+        self_bonus = referral_pool * 0.05
         if self_bonus >= 0.01:
             customer.commission_balance = (customer.commission_balance or 0) + self_bonus
             customer.total_earned = (customer.total_earned or 0) + self_bonus
@@ -792,7 +796,7 @@ def process_referral_commissions(booking, customer):
             )
             db.session.add(new_commission)
         
-        # PATH A: User becomes ACTIVE by doing their own service
+        # User becomes ACTIVE by doing their own service
         customer.is_referral_active = True
     
     # Process referral chain
@@ -802,10 +806,10 @@ def process_referral_commissions(booking, customer):
         if not referrer:
             break
         
-        # FIX #2: DELETED the skip inactive referrers block
-        # Inactive referrers NOW earn commissions
-        
-        commission = calculate_commission(referral_pool, level)
+        # Calculate commission based on level (geometric decay)
+        rate = BASE_COMMISSION_RATE * (COMMISSION_DECAY_FACTOR ** (level - 1))
+        commission = referral_pool * rate
+        commission = round(commission, 2) if commission >= 0.01 else 0
         
         if commission < 0.01:
             break
@@ -814,7 +818,7 @@ def process_referral_commissions(booking, customer):
         referrer.total_earned = (referrer.total_earned or 0) + commission
         total_commissions += commission
         
-        # PATH B: User becomes ACTIVE by earning from referral
+        # Activate referrer if inactive
         if not referrer.is_referral_active:
             referrer.is_referral_active = True
         
@@ -829,6 +833,7 @@ def process_referral_commissions(booking, customer):
         level += 1
         current_user = referrer
     
+    # Owner net = referral pool minus all commissions paid
     booking.total_commissions_paid = total_commissions
     booking.owner_net = referral_pool - total_commissions
     booking.commissions_processed = True
@@ -837,6 +842,7 @@ def process_referral_commissions(booking, customer):
     
     return {
         'success': True,
+        'referral_pool_percent': referral_pool_percent,
         'referral_pool': referral_pool,
         'total_commissions': total_commissions,
         'owner_net': booking.owner_net,
@@ -2974,6 +2980,7 @@ def init_db():
         db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS admin_share_percent DECIMAL(5,2) DEFAULT 10.0'))
         db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS website_share_percent DECIMAL(5,2) DEFAULT 10.0'))
         db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS provider_share_percent DECIMAL(5,2) DEFAULT 80.0'))
+        db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS referral_pool_percent DECIMAL(5,2) DEFAULT 10.0'))
         db.session.commit()
         print("✅ Share columns added to services table")
     except Exception as e:
@@ -2988,6 +2995,7 @@ def init_db():
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS website_share_percent_snapshot DECIMAL(5,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS provider_share_percent_snapshot DECIMAL(5,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS commissions_processed BOOLEAN DEFAULT false'))
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS referral_pool_percent_snapshot DECIMAL(5,2)'))
         db.session.commit()
         print("✅ Referral tracking columns added to service_requests")
     except Exception as e:
@@ -3041,7 +3049,8 @@ def init_db():
             UPDATE services SET 
                 admin_share_percent = 10.0,
                 website_share_percent = 10.0,
-                provider_share_percent = 80.0
+                provider_share_percent = 80.0,
+                referral_pool_percent = 10.0
             WHERE admin_share_percent IS NULL
         '''))
         db.session.commit()
@@ -3688,10 +3697,16 @@ def update_service_shares(service_id):
         service.website_share_percent = data['website_share_percent']
     if 'provider_share_percent' in data:
         service.provider_share_percent = data['provider_share_percent']
+    if 'referral_pool_percent' in data:
+        service.referral_pool_percent = data['referral_pool_percent']
     
-    total = (service.admin_share_percent or 0) + (service.website_share_percent or 0) + (service.provider_share_percent or 0)
+    total = (service.admin_share_percent or 0) + \
+            (service.website_share_percent or 0) + \
+            (service.provider_share_percent or 0) + \
+            (service.referral_pool_percent or 0)
+    
     if abs(total - 100) > 0.01:
-        return jsonify({'error': f'Total shares must equal 100%. Current total: {total}%'}), 400
+        return jsonify({'error': f'Total must equal 100%. Current total: {total}%'}), 400
     
     db.session.commit()
     
@@ -3702,9 +3717,11 @@ def update_service_shares(service_id):
             'name': service.name,
             'admin_share_percent': service.admin_share_percent,
             'website_share_percent': service.website_share_percent,
-            'provider_share_percent': service.provider_share_percent
+            'provider_share_percent': service.provider_share_percent,
+            'referral_pool_percent': service.referral_pool_percent
         }
     })
+    
 
 @app.route('/api/admin/referrals/user-tree/<int:user_id>', methods=['GET'])
 @admin_required
