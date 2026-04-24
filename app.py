@@ -328,13 +328,14 @@ class PercentageSetting(db.Model):
     __tablename__ = 'percentage_settings'
     id = db.Column(db.Integer, primary_key=True)
     provider_percent = db.Column(db.Float, default=60.0, nullable=False)
-    admin_percent = db.Column(db.Float, default=25.0, nullable=False)
-    site_fee_percent = db.Column(db.Float, default=15.0, nullable=False)
+    admin_percent = db.Column(db.Float, default=20.0, nullable=False)
+    site_fee_percent = db.Column(db.Float, default=10.0, nullable=False)
+    referral_pool_percent = db.Column(db.Float, default=10.0, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
 
     def get_total(self):
-        return self.provider_percent + self.admin_percent + self.site_fee_percent
+        return self.provider_percent + self.admin_percent + self.site_fee_percent + self.referral_pool_percent
     
     def is_valid(self):
         total = self.get_total()
@@ -451,7 +452,7 @@ def validate_password(password):
 def get_current_percentages():
     setting = PercentageSetting.query.first()
     if not setting:
-        setting = PercentageSetting(provider_percent=60.0, admin_percent=25.0, site_fee_percent=15.0)
+        setting = PercentageSetting(provider_percent=60.0, admin_percent=20.0, site_fee_percent=10.0, referral_pool_percent=10.0)
         db.session.add(setting)
         db.session.commit()
     return setting
@@ -683,6 +684,7 @@ def get_percentages():
         'provider_percent': setting.provider_percent,
         'admin_percent': setting.admin_percent,
         'site_fee_percent': setting.site_fee_percent,
+        'referral_pool_percent': setting.referral_pool_percent,
         'total': setting.get_total(),
         'is_valid': setting.is_valid(),
         'updated_at': setting.updated_at.isoformat() if setting.updated_at else None
@@ -695,22 +697,24 @@ def update_percentages():
     
     try:
         provider = float(data.get('provider_percent', 60))
-        admin = float(data.get('admin_percent', 25))
-        site_fee = float(data.get('site_fee_percent', 15))
+        admin = float(data.get('admin_percent', 20))
+        site_fee = float(data.get('site_fee_percent', 10))
+        referral_pool = float(data.get('referral_pool_percent', 10))
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid percentage values'}), 400
     
-    total = provider + admin + site_fee
+    total = provider + admin + site_fee + referral_pool
     if abs(total - 100) > 0.01:
         return jsonify({'error': f'Percentages must sum to 100%. Current total: {total}%'}), 400
     
-    if not all(0 <= p <= 100 for p in [provider, admin, site_fee]):
+    if not all(0 <= p <= 100 for p in [provider, admin, site_fee, referral_pool]):
         return jsonify({'error': 'Each percentage must be between 0 and 100'}), 400
     
     setting = get_current_percentages()
     setting.provider_percent = provider
     setting.admin_percent = admin
     setting.site_fee_percent = site_fee
+    setting.referral_pool_percent = referral_pool
     setting.updated_by = request.current_user.id
     db.session.commit()
     
@@ -718,6 +722,7 @@ def update_percentages():
         'provider_percent': provider,
         'admin_percent': admin,
         'site_fee_percent': site_fee,
+        'referral_pool_percent': referral_pool,
         'total': total
     })
     
@@ -727,10 +732,11 @@ def update_percentages():
             'provider_percent': provider,
             'admin_percent': admin,
             'site_fee_percent': site_fee,
+            'referral_pool_percent': referral_pool,
             'total': total
         }
     })
-
+    
 # ====================  HELPER FUNCTION ====================
 
 def generate_referral_code():
@@ -749,26 +755,26 @@ def calculate_commission(referral_pool, level):
 
 
 def process_referral_commissions(booking, customer):
+    """
+    Process referral commissions using referral_pool_percent from Percentage Settings
+    """
     self_bonus = 0  
     if booking.commissions_processed:
         return {'already_processed': True, 'total_commissions': booking.total_commissions_paid}
     
-    service = db.session.get(Service, booking.service_id)
-    if not service:
-        return {'error': 'Service not found'}
-    
-    # Get the separate referral pool percentage
-    referral_pool_percent = service.referral_pool_percent or 10.0
+    # Get percentages from GLOBAL settings (NOT from service table)
+    percentages = get_current_percentages()
+    referral_pool_percent = percentages.referral_pool_percent
     
     # Calculate referral pool amount from booking amount
     referral_pool = booking.amount * referral_pool_percent / 100
     
     # Store snapshots
     booking.referral_pool_amount = referral_pool
-    booking.admin_share_percent_snapshot = service.admin_share_percent or 10.0
-    booking.website_share_percent_snapshot = service.website_share_percent or 10.0
-    booking.provider_share_percent_snapshot = service.provider_share_percent or 80.0
     booking.referral_pool_percent_snapshot = referral_pool_percent
+    booking.admin_share_percent_snapshot = percentages.admin_percent
+    booking.site_fee_percent_snapshot = percentages.site_fee_percent
+    booking.provider_share_percent_snapshot = percentages.provider_percent
     
     total_commissions = 0
     level = 1
@@ -849,7 +855,6 @@ def process_referral_commissions(booking, customer):
         'levels_processed': level - 1,
         'self_bonus': self_bonus if user_completed_bookings == 0 else 0
     }
-
     
 # ==================== AUTH ROUTES ====================
   # ==================== AUTH ROUTES ====================
