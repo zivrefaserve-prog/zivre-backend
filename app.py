@@ -2993,17 +2993,17 @@ def init_db():
         print("✅ Share columns added to services table")
     except Exception as e:
         print(f"⚠️ Services columns note: {e}")
-
-        # 8. Add referral_pool_amount to services table
+    
+    # 3. Add referral_pool_amount to services table
     try:
         db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS referral_pool_amount DECIMAL(12,2) DEFAULT 0'))
         db.session.commit()
         print("✅ referral_pool_amount added to services table")
     except Exception as e:
         print(f"⚠️ services column note: {e}")
-        
-        # 3. Add referral tracking to service_requests
-        try:
+    
+    # 4. Add referral tracking to service_requests
+    try:
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS referral_pool_amount DECIMAL(12,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS total_commissions_paid DECIMAL(12,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS owner_net DECIMAL(12,2)'))
@@ -3017,7 +3017,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Service requests columns note: {e}")
     
-    # 4. Create commissions table
+    # 5. Create commissions table
     try:
         db.session.execute(text('''
             CREATE TABLE IF NOT EXISTS commissions (
@@ -3036,7 +3036,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Commissions table note: {e}")
     
-    # 5. Create withdrawal_requests table
+    # 6. Create withdrawal_requests table
     try:
         db.session.execute(text('''
             CREATE TABLE IF NOT EXISTS withdrawal_requests (
@@ -3059,14 +3059,15 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Withdrawal requests table note: {e}")
     
-    # 6. Update existing services with default shares
+    # 7. Update existing services with default shares
     try:
         db.session.execute(text('''
             UPDATE services SET 
                 admin_share_percent = 10.0,
                 website_share_percent = 10.0,
                 provider_share_percent = 80.0,
-                referral_pool_percent = 10.0
+                referral_pool_percent = 10.0,
+                referral_pool_amount = total_price * 10.0 / 100
             WHERE admin_share_percent IS NULL
         '''))
         db.session.commit()
@@ -3074,7 +3075,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Services update note: {e}")
     
-    # 7. Generate referral codes for existing users who don't have one
+    # 8. Generate referral codes for existing users who don't have one
     try:
         db.session.execute(text('''
             UPDATE users SET referral_code = UPPER(SUBSTRING(MD5(id::TEXT) FROM 1 FOR 8))
@@ -3094,8 +3095,9 @@ def init_db():
     if not PercentageSetting.query.first():
         default_percentages = PercentageSetting(
             provider_percent=60.0,
-            admin_percent=25.0,
-            site_fee_percent=15.0
+            admin_percent=20.0,
+            site_fee_percent=10.0,
+            referral_pool_percent=10.0
         )
         db.session.add(default_percentages)
     
@@ -3161,6 +3163,7 @@ def init_db():
             provider_payout = price * (percentages.provider_percent / 100)
             admin_fee = price * (percentages.admin_percent / 100)
             site_fee = price * (percentages.site_fee_percent / 100)
+            referral_pool_amount = price * (percentages.referral_pool_percent / 100)
             
             service = Service(
                 name=name, 
@@ -3169,6 +3172,7 @@ def init_db():
                 provider_payout=provider_payout,
                 admin_fee=admin_fee,
                 site_fee=site_fee,
+                referral_pool_amount=referral_pool_amount,
                 icon=icon, 
                 is_active=False
             )
@@ -3211,12 +3215,10 @@ def init_db():
         db.session.add(sample_provider)
         print("✅ Created new test provider")
     else:
-        # FIX: Update existing provider with correct credentials
         sample_provider.is_verified = True
         sample_provider.is_active = True
         if hvac_service:
             sample_provider.service_specialization_id = hvac_service.id
-        # FORCE reset password to ensure it's correct
         sample_provider.password = generate_password_hash('Provider123!')
         db.session.add(sample_provider)
         print("✅ Updated existing test provider with correct password")
