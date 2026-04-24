@@ -1328,9 +1328,11 @@ def create_service():
         
         percentages = get_current_percentages()
         
+        # Calculate based on ALL percentages summing to 100%
         provider_payout = total_price * (percentages.provider_percent / 100)
         admin_fee = total_price * (percentages.admin_percent / 100)
         site_fee = total_price * (percentages.site_fee_percent / 100)
+        referral_pool_amount = total_price * (percentages.referral_pool_percent / 100)  # ADD THIS
         
         new_service = Service(
             name=data.get('name'),
