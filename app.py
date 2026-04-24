@@ -717,8 +717,6 @@ def update_percentages():
     setting.referral_pool_percent = referral_pool
     setting.updated_by = request.current_user.id
     db.session.commit()
-
-        db.session.commit()
     
     # ========== AUTO-RECALCULATE ALL EXISTING SERVICES ==========
     try:
