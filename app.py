@@ -199,7 +199,7 @@ class Service(db.Model):
     website_share_percent = db.Column(db.Float, default=10.0)
     provider_share_percent = db.Column(db.Float, default=80.0)
     referral_pool_percent = db.Column(db.Float, default=10.0)
-
+    referral_pool_amount = db.Column(db.Float, default=0)
 
 
 class Quote(db.Model):
@@ -1328,11 +1328,10 @@ def create_service():
         
         percentages = get_current_percentages()
         
-        # Calculate based on ALL percentages summing to 100%
         provider_payout = total_price * (percentages.provider_percent / 100)
         admin_fee = total_price * (percentages.admin_percent / 100)
         site_fee = total_price * (percentages.site_fee_percent / 100)
-        referral_pool_amount = total_price * (percentages.referral_pool_percent / 100)  # ADD THIS
+        referral_pool_amount = total_price * (percentages.referral_pool_percent / 100)
         
         new_service = Service(
             name=data.get('name'),
@@ -1341,6 +1340,7 @@ def create_service():
             provider_payout=provider_payout,
             admin_fee=admin_fee,
             site_fee=site_fee,
+            referral_pool_amount=referral_pool_amount,  # ← ADD THIS
             icon=data.get('icon', '🔧'),
             is_active=False
         )
@@ -1407,6 +1407,7 @@ def update_service(service_id):
         service.provider_payout = total_price * (percentages.provider_percent / 100)
         service.admin_fee = total_price * (percentages.admin_percent / 100)
         service.site_fee = total_price * (percentages.site_fee_percent / 100)
+        service.referral_pool_amount = total_price * (percentages.referral_pool_percent / 100)  # ← ADD THIS
         service.name = data.get('name', service.name)
         service.description = data.get('description', service.description)
         service.icon = data.get('icon', service.icon)
@@ -2992,9 +2993,17 @@ def init_db():
         print("✅ Share columns added to services table")
     except Exception as e:
         print(f"⚠️ Services columns note: {e}")
-    
-    # 3. Add referral tracking to service_requests
+
+        # 8. Add referral_pool_amount to services table
     try:
+        db.session.execute(text('ALTER TABLE services ADD COLUMN IF NOT EXISTS referral_pool_amount DECIMAL(12,2) DEFAULT 0'))
+        db.session.commit()
+        print("✅ referral_pool_amount added to services table")
+    except Exception as e:
+        print(f"⚠️ services column note: {e}")
+        
+        # 3. Add referral tracking to service_requests
+        try:
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS referral_pool_amount DECIMAL(12,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS total_commissions_paid DECIMAL(12,2)'))
         db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS owner_net DECIMAL(12,2)'))
