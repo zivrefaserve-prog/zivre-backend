@@ -817,6 +817,14 @@ def process_referral_commissions(booking, customer):
                 amount=self_bonus
             )
             db.session.add(new_commission)
+            
+            # Notify customer of self-bonus
+            socketio.emit('new_commission', {
+                'user_id': customer.id,
+                'amount': self_bonus,
+                'level': 0,
+                'booking_id': booking.id
+            }, room=f"user_{customer.id}")
         
         # User becomes ACTIVE by doing their own service
         customer.is_referral_active = True
@@ -852,6 +860,14 @@ def process_referral_commissions(booking, customer):
         )
         db.session.add(new_commission)
         
+        # Notify referrer of new commission
+        socketio.emit('new_commission', {
+            'user_id': referrer.id,
+            'amount': commission,
+            'level': level,
+            'booking_id': booking.id
+        }, room=f"user_{referrer.id}")
+        
         level += 1
         current_user = referrer
     
@@ -871,6 +887,7 @@ def process_referral_commissions(booking, customer):
         'levels_processed': level - 1,
         'self_bonus': self_bonus if user_completed_bookings == 0 else 0
     }
+    
     
 # ==================== AUTH ROUTES ====================
   # ==================== AUTH ROUTES ====================
@@ -980,7 +997,14 @@ def signup():
     
     db.session.add(new_user)
     db.session.commit()
-    
+
+    # If user signed up with a referral code, notify the referrer to update their tree
+    if referrer_id:
+        socketio.emit('referral_tree_updated', {
+            'user_id': referrer_id,
+            'new_user_id': new_user.id
+        }, room=f"user_{referrer_id}")
+        
     # Generate JWT token for auto-login
     token = jwt.encode({
         'user_id': new_user.id,
@@ -1976,12 +2000,22 @@ def confirm_request_completion(request_id):
         service_request.customer_confirmed = True
         service_request.status = 'confirmed'
         db.session.commit()
+
         
         print(f"✅ Customer confirmed completion for request {request_id}")
         
         # TRIGGER REFERRAL COMMISSIONS
         commission_result = process_referral_commissions(service_request, request.current_user)
-        
+
+                # Notify admin that booking is confirmed and commissions processed
+        socketio.emit('booking_confirmed', {
+            'booking_id': request_id,
+            'customer_id': service_request.user_id,
+            'amount': service_request.amount,
+            'commission_result': commission_result
+        }, room='role_admin')
+
+    
         if commission_result.get('success'):
             print(f"💰 Referral commissions processed: {commission_result}")
             if commission_result.get('self_bonus', 0) > 0:
@@ -3527,6 +3561,16 @@ def request_withdrawal():
     db.session.add(withdrawal)
     db.session.commit()
     
+    # Notify admin of new withdrawal request
+    admin = User.query.filter_by(role='admin').first()
+    if admin:
+        socketio.emit('new_withdrawal_request', {
+            'withdrawal_id': withdrawal.id,
+            'user_name': user.full_name,
+            'amount': amount,
+            'user_id': user.id
+        }, room=f"user_{admin.id}")
+        
     # Notify admin
     admin = User.query.filter_by(role='admin').first()
     if admin:
@@ -3635,6 +3679,21 @@ def mark_withdrawal_sent(withdrawal_id):
     withdrawal.admin_notes = notes
     
     db.session.commit()
+
+
+        # Notify user that withdrawal has been sent
+    socketio.emit('withdrawal_updated', {
+        'withdrawal_id': withdrawal_id,
+        'status': 'admin_sent',
+        'amount': withdrawal.amount
+    }, room=f"user_{withdrawal.user_id}")
+    
+    # Notify admin (for dashboard refresh)
+    socketio.emit('withdrawal_updated', {
+        'withdrawal_id': withdrawal_id,
+        'status': 'admin_sent'
+    }, room='role_admin')
+
     
     create_notification(
         withdrawal.user_id,
@@ -3670,6 +3729,14 @@ def confirm_withdrawal_receipt(withdrawal_id):
     withdrawal.user_confirmed_at = datetime.utcnow()
     
     db.session.commit()
+
+
+        # Notify admin that user confirmed receipt
+    socketio.emit('withdrawal_updated', {
+        'withdrawal_id': withdrawal_id,
+        'status': 'user_confirmed',
+        'user_id': withdrawal.user_id
+    }, room='role_admin')
     
     return jsonify({
         'message': 'Withdrawal confirmed successfully',
@@ -3743,6 +3810,14 @@ def update_service_shares(service_id):
         return jsonify({'error': f'Total must equal 100%. Current total: {total}%'}), 400
     
     db.session.commit()
+
+        socketio.emit('service_shares_updated', {
+        'service_id': service_id,
+        'admin_share_percent': service.admin_share_percent,
+        'website_share_percent': service.website_share_percent,
+        'provider_share_percent': service.provider_share_percent,
+        'referral_pool_percent': service.referral_pool_percent
+    })
     
     return jsonify({
         'message': 'Service shares updated successfully',
