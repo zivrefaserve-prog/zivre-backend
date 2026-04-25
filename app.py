@@ -3811,7 +3811,7 @@ def update_service_shares(service_id):
     
     db.session.commit()
 
-        socketio.emit('service_shares_updated', {  # ← PROBLEM: Extra spaces at the beginning!
+    socketio.emit('service_shares_updated', {  # ← 4 spaces (aligned with commit)
         'service_id': service_id,
         'admin_share_percent': service.admin_share_percent,
         'website_share_percent': service.website_share_percent,
