@@ -3425,7 +3425,7 @@ def init_db():
             phone='+233000000000',
             role='admin',
             is_verified=True,
-            is_active=True
+            is_active=True,
             email_verified=True,           # ← ADD THIS
             verification_token=None,        # ← ADD THIS
             verification_token_expiry=None  # ← ADD THIS
@@ -3453,7 +3453,7 @@ def init_db():
             role='provider',
             is_verified=True,
             is_active=True,
-            service_specialization_id=hvac_service.id if hvac_service else None
+            service_specialization_id=hvac_service.id if hvac_service else None,
             email_verified=True,           # ← ADD THIS
             verification_token=None,        # ← ADD THIS
             verification_token_expiry=None  # ← ADD THIS
