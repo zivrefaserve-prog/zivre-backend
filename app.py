@@ -3416,18 +3416,28 @@ def init_db():
             db.session.add(service)
             created_services.append(service)
     
-    admin = User.query.filter_by(email='admin@zivre.com').first()
-    if not admin:
-        admin = User(
-            email='admin@zivre.com',
-            password=generate_password_hash('Admin123!'),
-            full_name='Admin User',
-            phone='+233000000000',
-            role='admin',
-            is_verified=True,
-            is_active=True
-        )
-        db.session.add(admin)
+admin = User.query.filter_by(email='admin@zivre.com').first()
+if not admin:
+    admin = User(
+        email='admin@zivre.com',
+        password=generate_password_hash('Admin123!'),
+        full_name='Admin User',
+        phone='+233000000000',
+        role='admin',
+        is_verified=True,
+        is_active=True,
+        email_verified=True,           # ← ADD THIS
+        verification_token=None,        # ← ADD THIS
+        verification_token_expiry=None  # ← ADD THIS
+    )
+    db.session.add(admin)
+else:
+    # ✅ Also update existing admin
+    admin.email_verified = True
+    admin.verification_token = None
+    admin.verification_token_expiry = None
+    db.session.add(admin)
+    
     else:
         admin.is_active = True
         admin.is_verified = True
@@ -3447,9 +3457,19 @@ def init_db():
             role='provider',
             is_verified=True,
             is_active=True,
-            service_specialization_id=hvac_service.id if hvac_service else None
+            service_specialization_id=hvac_service.id if hvac_service else None,
+            email_verified=True,           # ← ADD THIS
+            verification_token=None,        # ← ADD THIS
+            verification_token_expiry=None  # ← ADD THIS
         )
         db.session.add(sample_provider)
+    else:
+        # ✅ Also update existing provider
+        sample_provider.email_verified = True
+        sample_provider.verification_token = None
+        sample_provider.verification_token_expiry = None
+        db.session.add(sample_provider)
+    
         print("✅ Created new test provider")
     else:
         sample_provider.is_verified = True
