@@ -2910,26 +2910,70 @@ def get_user_full_details(user_id):
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
 @admin_required
 def delete_user(user_id):
-    user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    if user.role == 'admin':
-        return jsonify({'error': 'Cannot delete admin user'}), 403
-    
-    ServiceRequest.query.filter_by(user_id=user_id).delete()
-    ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
-    Notification.query.filter_by(user_id=user_id).delete()
-    Message.query.filter((Message.sender_id == user_id) | (Message.receiver_id == user_id)).delete()
-    Comment.query.filter_by(user_id=user_id).delete()
-    CommentReply.query.filter_by(user_id=user_id).delete()
-    
-    db.session.delete(user)
-    db.session.commit()
-    
-    socketio.emit('user_deleted', {'user_id': user_id})
-    
-    return jsonify({'message': 'User deleted successfully'})
+    try:
+        user = db.session.get(User, user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if user.role == 'admin':
+            return jsonify({'error': 'Cannot delete admin user'}), 403
+        
+        # Delete related records safely
+        try:
+            ServiceRequest.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting service requests: {e}")
+            
+        try:
+            ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
+        except Exception as e:
+            print(f"Error updating provider requests: {e}")
+            
+        try:
+            Notification.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting notifications: {e}")
+            
+        try:
+            Message.query.filter((Message.sender_id == user_id) | (Message.receiver_id == user_id)).delete()
+        except Exception as e:
+            print(f"Error deleting messages: {e}")
+            
+        try:
+            Comment.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting comments: {e}")
+            
+        try:
+            CommentReply.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting comment replies: {e}")
+        
+        # Also delete commission records
+        try:
+            Commission.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting commissions: {e}")
+        
+        # Also delete withdrawal requests
+        try:
+            WithdrawalRequest.query.filter_by(user_id=user_id).delete()
+        except Exception as e:
+            print(f"Error deleting withdrawal requests: {e}")
+        
+        db.session.delete(user)
+        db.session.commit()
+        
+        socketio.emit('user_deleted', {'user_id': user_id})
+        socketio.emit('users_updated', {})
+        
+        return jsonify({'message': 'User deleted successfully'})
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error deleting user {user_id}: {str(e)}")
+        return jsonify({'error': f'Error deleting user: {str(e)}'}), 500
+        
 
 @app.route('/api/admin/users/<int:user_id>/verify', methods=['PUT'])
 @admin_required
