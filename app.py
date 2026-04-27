@@ -177,6 +177,10 @@ class User(db.Model):
     total_earned = db.Column(db.Float, default=0)
     position = db.Column(db.String(10), nullable=True)  # left, center, right
     # ===============================================
+    # ========== ADD THESE VERIFICATION FIELDS ==========
+    email_verified = db.Column(db.Boolean, default=False)
+    verification_token = db.Column(db.String(100), nullable=True)
+    verification_token_expiry = db.Column(db.DateTime, nullable=True)
     
     service_specialization = db.relationship('Service', foreign_keys=[service_specialization_id])
 
@@ -512,6 +516,63 @@ def send_reset_email(user_email, user_name, reset_token):
     except Exception as e:
         print(f"❌ Email error: {str(e)}")
         return True
+
+
+def send_verification_email(user_email, user_name, verification_token):
+    try:
+        frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
+        verification_link = f"{frontend_url}/verify-email?token={verification_token}"
+        
+        print(f"\n{'='*60}")
+        print(f"📧 EMAIL VERIFICATION LINK (copy this URL to verify email):")
+        print(f"{verification_link}")
+        print(f"{'='*60}\n")
+        
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        smtp_username = "zivrefaserve@gmail.com"
+        smtp_password = os.environ.get('SMTP_PASSWORD', 'jmivcbvhipysvgcl')
+        
+        subject = "Verify Your Zivre Email Address"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"></head>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+                <h2 style="color: #10b981;">Welcome to Zivre!</h2>
+                <p>Hello {user_name},</p>
+                <p>Please verify your email address to complete your registration.</p>
+                <a href="{verification_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0;">Verify Email Address</a>
+                <p>Or copy this link: <strong style="color: #10b981;">{verification_link}</strong></p>
+                <p>This link expires in <strong>24 hours</strong>.</p>
+                <p>If you didn't create an account, please ignore this email.</p>
+                <hr style="margin: 20px 0;">
+                <p style="color: #64748b; font-size: 12px;">Zivre Facility Services - Professional facility management across Ghana</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        msg = MIMEMultipart('alternative')
+        msg['From'] = smtp_username
+        msg['To'] = user_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"✅ Verification email sent to {user_email}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Verification email error: {str(e)}")
+        return False
 
 # ==================== WEBSOCKET EVENTS ====================
 
@@ -902,7 +963,15 @@ def login():
     
     if not user.is_active:
         return jsonify({'error': 'Account has been suspended'}), 401
-    
+
+        # ✅ ADD THIS CHECK - Email verification required
+    if not user.email_verified:
+        return jsonify({
+            'error': 'Please verify your email address before logging in.',
+            'requires_verification': True,
+            'email': user.email
+        }), 403
+        
     # Generate JWT token
     token = jwt.encode({
         'user_id': user.id,
@@ -981,6 +1050,10 @@ def signup():
             else:
                 return jsonify({'error': 'This referrer already has maximum children (3)'}), 400
     
+    # Generate verification token
+    verification_token = str(uuid.uuid4())
+    verification_expiry = datetime.utcnow() + timedelta(hours=24)
+    
     new_user = User(
         email=data.get('email'),
         password=hashed_password,
@@ -988,15 +1061,28 @@ def signup():
         phone=data.get('phone'),
         role=data.get('role', 'customer'),
         service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
-        is_verified=False if data.get('role') == 'provider' else True,
+        is_verified=False if data.get('role') == 'provider' else False,  # ← Changed: ALL users need email verification
         is_referral_active=False,
         referral_code=generate_referral_code(),
         referrer_id=referrer_id,
-        position=position
+        position=position,
+        email_verified=False,  # ← NEW: Not verified yet
+        verification_token=verification_token,  # ← NEW
+        verification_token_expiry=verification_expiry  # ← NEW
     )
     
     db.session.add(new_user)
     db.session.commit()
+    
+    # Send verification email
+    send_verification_email(new_user.email, new_user.full_name, verification_token)
+    
+    # Return response WITHOUT auto-login (they need to verify first)
+    return jsonify({
+        'message': 'Registration successful! Please check your email to verify your account.',
+        'requires_verification': True,
+        'email': new_user.email
+    }), 201
 
     # If user signed up with a referral code, notify the referrer to update their tree
     if referrer_id:
@@ -1122,6 +1208,75 @@ def reset_password():
     
     return jsonify({'message': 'Password reset successfully'})
 
+
+@app.route('/api/auth/verify-email', methods=['POST'])
+def verify_email():
+    data = request.json
+    token = data.get('token')
+    
+    print(f"📧 Email verification request with token: {token}")
+    
+    if not token:
+        return jsonify({'error': 'Verification token is required'}), 400
+    
+    user = User.query.filter_by(verification_token=token).first()
+    
+    if not user:
+        return jsonify({'error': 'Invalid verification token'}), 400
+    
+    if user.email_verified:
+        return jsonify({'message': 'Email already verified. You can now login.'}), 200
+    
+    if user.verification_token_expiry < datetime.utcnow():
+        return jsonify({'error': 'Verification link has expired. Please request a new one.'}), 400
+    
+    # Verify the email
+    user.email_verified = True
+    user.verification_token = None
+    user.verification_token_expiry = None
+    
+    # If user is a customer, they are now active
+    if user.role == 'customer':
+        user.is_verified = True
+    
+    db.session.commit()
+    
+    print(f"✅ Email verified for user: {user.email}")
+    
+    return jsonify({
+        'message': 'Email verified successfully! You can now login.',
+        'verified': True
+    })
+
+@app.route('/api/auth/resend-verification', methods=['POST'])
+def resend_verification():
+    data = request.json
+    email = data.get('email')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+    
+    user = User.query.filter_by(email=email).first()
+    
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user.email_verified:
+        return jsonify({'error': 'Email already verified'}), 400
+    
+    # Generate new token
+    verification_token = str(uuid.uuid4())
+    user.verification_token = verification_token
+    user.verification_token_expiry = datetime.utcnow() + timedelta(hours=24)
+    db.session.commit()
+    
+    # Send new verification email
+    send_verification_email(user.email, user.full_name, verification_token)
+    
+    return jsonify({'message': 'Verification email sent. Please check your inbox.'})
+
+
+    
 @app.route('/api/auth/user/<int:user_id>', methods=['GET'])
 @token_required
 def get_user(user_id):
@@ -3087,8 +3242,19 @@ def init_db():
         print("✅ Referral tracking columns added to service_requests")
     except Exception as e:
         print(f"⚠️ Service requests columns note: {e}")
-    
-    # 5. Create commissions table
+
+        
+    # 5. Add email verification columns to users table
+    try:
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token VARCHAR(100)'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token_expiry TIMESTAMP'))
+        db.session.commit()
+        print("✅ Email verification columns added to users table")
+    except Exception as e:
+        print(f"⚠️ Verification columns note: {e}")
+        
+    # 6. Create commissions table
     try:
         db.session.execute(text('''
             CREATE TABLE IF NOT EXISTS commissions (
@@ -3107,7 +3273,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Commissions table note: {e}")
     
-    # 6. Create withdrawal_requests table
+    # 7. Create withdrawal_requests table
     try:
         db.session.execute(text('''
             CREATE TABLE IF NOT EXISTS withdrawal_requests (
@@ -3130,7 +3296,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Withdrawal requests table note: {e}")
     
-    # 7. Update existing services with default shares
+    # 8. Update existing services with default shares
     try:
         db.session.execute(text('''
             UPDATE services SET 
@@ -3146,7 +3312,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Services update note: {e}")
     
-    # 8. Generate referral codes for existing users who don't have one
+    # 9. Generate referral codes for existing users who don't have one
     try:
         db.session.execute(text('''
             UPDATE users SET referral_code = UPPER(SUBSTRING(MD5(id::TEXT) FROM 1 FOR 8))
