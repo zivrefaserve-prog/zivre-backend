@@ -3,11 +3,6 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify, session, send_from_directory
-import io
-import qrcode
-import base64
-from xhtml2pdf import pisa
-from jinja2 import Template
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -27,7 +22,6 @@ from flask_limiter.util import get_remote_address
 from sqlalchemy import text
 import mimetypes
 import jwt
-
 
 load_dotenv()
 
@@ -375,7 +369,6 @@ class WithdrawalRequest(db.Model):
     admin_processed_at = db.Column(db.DateTime, nullable=True)
     user_confirmed_at = db.Column(db.DateTime, nullable=True)
     admin_notes = db.Column(db.String(500))
-    transaction_id = db.Column(db.String(50), unique=True, nullable=True)  # ← ADD THIS LINE
     
     user = db.relationship('User', foreign_keys=[user_id])
 # ==================== HELPER FUNCTIONS ====================
@@ -3250,6 +3243,7 @@ def ping():
 
 # ==================== INITIAL DATA ====================
 # ==================== INITIAL DATA ====================
+
 def init_db():
     db.create_all()
     
@@ -3358,16 +3352,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Withdrawal requests table note: {e}")
     
-    # 8. Add transaction_id to withdrawal_requests (NEW - for receipts)
-    try:
-        db.session.execute(text('ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(50) UNIQUE'))
-        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_transaction_id ON withdrawal_requests(transaction_id)'))
-        db.session.commit()
-        print("✅ transaction_id column added to withdrawal_requests")
-    except Exception as e:
-        print(f"⚠️ transaction_id column note: {e}")
-    
-    # 9. Update existing services with default shares
+    # 8. Update existing services with default shares
     try:
         db.session.execute(text('''
             UPDATE services SET 
@@ -3383,7 +3368,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Services update note: {e}")
     
-    # 10. Generate referral codes for existing users who don't have one
+    # 9. Generate referral codes for existing users who don't have one
     try:
         db.session.execute(text('''
             UPDATE users SET referral_code = UPPER(SUBSTRING(MD5(id::TEXT) FROM 1 FOR 8))
@@ -3393,6 +3378,10 @@ def init_db():
         print("✅ Referral codes generated for existing users")
     except Exception as e:
         print(f"⚠️ Referral codes note: {e}")
+    
+    # ============================================
+    # END OF REFERRAL SYSTEM MIGRATION
+    # ============================================
     
     # ========== YOUR EXISTING CODE CONTINUES BELOW ==========
     
@@ -3493,19 +3482,19 @@ def init_db():
             role='admin',
             is_verified=True,
             is_active=True,
-            email_verified=True,
-            verification_token=None,
-            verification_token_expiry=None
+            email_verified=True,           # ← ADD THIS
+            verification_token=None,        # ← ADD THIS
+            verification_token_expiry=None  # ← ADD THIS
         )
         db.session.add(admin)
     else:
         admin.is_active = True
         admin.is_verified = True
-        admin.email_verified = True
-        admin.verification_token = None
-        admin.verification_token_expiry = None
-        # FIX: Always regenerate password to ensure it's valid
-        admin.password = generate_password_hash('Admin123!')
+        admin.email_verified = True         # ← ADD THIS
+        admin.verification_token = None     # ← ADD THIS
+        admin.verification_token_expiry = None  # ← ADD THIS
+        if not check_password_hash(admin.password, 'Admin123!'):
+            admin.password = generate_password_hash('Admin123!')
         db.session.add(admin)
     
     hvac_service = Service.query.filter_by(name='HVAC Systems').first()
@@ -3521,25 +3510,23 @@ def init_db():
             is_verified=True,
             is_active=True,
             service_specialization_id=hvac_service.id if hvac_service else None,
-            email_verified=True,
-            verification_token=None,
-            verification_token_expiry=None
+            email_verified=True,           # ← ADD THIS
+            verification_token=None,        # ← ADD THIS
+            verification_token_expiry=None  # ← ADD THIS
         )
         db.session.add(sample_provider)
         print("✅ Created new test provider")
     else:
         sample_provider.is_verified = True
         sample_provider.is_active = True
-        sample_provider.email_verified = True
-        sample_provider.verification_token = None
-        sample_provider.verification_token_expiry = None
+        sample_provider.email_verified = True      # ← ADD THIS
+        sample_provider.verification_token = None  # ← ADD THIS
+        sample_provider.verification_token_expiry = None  # ← ADD THIS
         if hvac_service:
             sample_provider.service_specialization_id = hvac_service.id
-        # FIX: Always regenerate password to ensure it's valid
         sample_provider.password = generate_password_hash('Provider123!')
         db.session.add(sample_provider)
         print("✅ Updated existing test provider with correct password")
-
     
     db.session.commit()
     
@@ -3565,7 +3552,6 @@ def init_db():
 
     db.session.commit()
     print("✅ Database initialized successfully!")
-
 
 # ==================== INITIALIZE DATABASE ====================
 with app.app_context():
@@ -3943,23 +3929,19 @@ def mark_withdrawal_sent(withdrawal_id):
     if withdrawal.status != 'pending':
         return jsonify({'error': f'Withdrawal already {withdrawal.status}'}), 400
     
-    # ✅ GENERATE UNIQUE TRANSACTION ID
-    import secrets
-    transaction_id = f"ZIV-WD-{secrets.token_hex(4).upper()}"
-    withdrawal.transaction_id = transaction_id
-    
+    # DO NOT deduct balance here - balance is still with user
     withdrawal.status = 'admin_sent'
     withdrawal.admin_processed_at = datetime.utcnow()
     withdrawal.admin_notes = notes
     
     db.session.commit()
 
-    # Notify user that withdrawal has been sent
+
+        # Notify user that withdrawal has been sent
     socketio.emit('withdrawal_updated', {
         'withdrawal_id': withdrawal_id,
         'status': 'admin_sent',
-        'amount': withdrawal.amount,
-        'transaction_id': transaction_id   # ← ADD THIS
+        'amount': withdrawal.amount
     }, room=f"user_{withdrawal.user_id}")
     
     # Notify admin (for dashboard refresh)
@@ -3971,337 +3953,13 @@ def mark_withdrawal_sent(withdrawal_id):
     
     create_notification(
         withdrawal.user_id,
-        f'💰 Your withdrawal of GHS{withdrawal.amount} has been sent to your {withdrawal.payment_method}. Transaction ID: {transaction_id}. Please confirm receipt.',
+        f'💰 Your withdrawal of GHS{withdrawal.amount} has been sent to your {withdrawal.payment_method}. Please confirm receipt.',
         'success',
         '/referrals'
     )
     
-    return jsonify({'message': 'Withdrawal marked as sent', 'status': 'admin_sent', 'transaction_id': transaction_id})
-
-
-
-@app.route('/api/referrals/withdrawals/<int:withdrawal_id>/receipt', methods=['GET'])
-@token_required
-def download_withdrawal_receipt(withdrawal_id):
-    """Generate PDF receipt for a withdrawal"""
-    withdrawal = db.session.get(WithdrawalRequest, withdrawal_id)
+    return jsonify({'message': 'Withdrawal marked as sent', 'status': 'admin_sent'})
     
-    if not withdrawal:
-        return jsonify({'error': 'Withdrawal not found'}), 404
-    
-    # Check authorization: user can view their own, admin can view any
-    if request.current_user.id != withdrawal.user_id and request.current_user.role != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 403
-    
-    # Only allow receipt for confirmed or sent withdrawals
-    if withdrawal.status not in ['admin_sent', 'user_confirmed']:
-        return jsonify({'error': 'Receipt only available for processed withdrawals'}), 400
-    
-    # Get user details
-    user = db.session.get(User, withdrawal.user_id)
-    
-    # Generate QR code with transaction ID for verification
-    frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
-    verification_url = f"{frontend_url}/verify-receipt?txn={withdrawal.transaction_id}"
-    
-    qr = qrcode.QRCode(box_size=4, border=2)
-    qr.add_data(verification_url)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="#0f3b2c", back_color="white")
-    
-    # Convert QR code to base64 for embedding in PDF
-    buffered = io.BytesIO()
-    qr_img.save(buffered, format="PNG")
-    qr_base64 = base64.b64encode(buffered.getvalue()).decode()
-    
-    # HTML Template for PDF
-    html_template = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>Zivre Withdrawal Receipt</title>
-        <style>
-            @page {
-                size: A4;
-                margin: 2cm;
-            }
-            body {
-                font-family: 'Inter', 'Helvetica', 'Arial', sans-serif;
-                line-height: 1.5;
-                color: #1e293b;
-            }
-            .receipt-container {
-                max-width: 600px;
-                margin: 0 auto;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-                overflow: hidden;
-            }
-            .receipt-header {
-                background: linear-gradient(135deg, #0f3b2c 0%, #1a5a44 100%);
-                color: white;
-                padding: 30px 20px;
-                text-align: center;
-            }
-            .receipt-header h1 {
-                margin: 0;
-                font-size: 28px;
-                letter-spacing: 2px;
-            }
-            .receipt-header p {
-                margin: 5px 0 0;
-                opacity: 0.8;
-                font-size: 12px;
-            }
-            .receipt-body {
-                padding: 30px 25px;
-                background: white;
-            }
-            .title {
-                font-size: 20px;
-                font-weight: 700;
-                text-align: center;
-                margin-bottom: 25px;
-                color: #0f3b2c;
-            }
-            .info-row {
-                display: flex;
-                justify-content: space-between;
-                padding: 12px 0;
-                border-bottom: 1px solid #e2e8f0;
-            }
-            .info-label {
-                font-weight: 600;
-                color: #64748b;
-                font-size: 13px;
-            }
-            .info-value {
-                font-weight: 600;
-                color: #0f172a;
-                font-size: 13px;
-            }
-            .amount-row {
-                background: #f0fdf4;
-                padding: 15px;
-                border-radius: 12px;
-                margin: 20px 0;
-                text-align: center;
-            }
-            .amount-label {
-                font-size: 12px;
-                color: #059669;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }
-            .amount-value {
-                font-size: 32px;
-                font-weight: 800;
-                color: #10b981;
-            }
-            .status-badge {
-                display: inline-block;
-                padding: 4px 12px;
-                border-radius: 20px;
-                font-size: 11px;
-                font-weight: 600;
-                background: #e8f5e9;
-                color: #4caf50;
-            }
-            .footer {
-                background: #f8fafc;
-                padding: 20px;
-                text-align: center;
-                border-top: 1px solid #e2e8f0;
-            }
-            .footer p {
-                margin: 5px 0;
-                font-size: 10px;
-                color: #94a3b8;
-            }
-            .qr-code {
-                text-align: center;
-                margin: 20px 0;
-            }
-            .qr-code img {
-                width: 100px;
-                height: 100px;
-            }
-            .verification-note {
-                font-size: 10px;
-                color: #64748b;
-                text-align: center;
-                margin-top: 15px;
-            }
-            .signature {
-                margin-top: 30px;
-                text-align: center;
-                border-top: 1px dashed #e2e8f0;
-                padding-top: 20px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="receipt-container">
-            <div class="receipt-header">
-                <h1>ZIVRE</h1>
-                <p>Facility Services • Ghana</p>
-            </div>
-            
-            <div class="receipt-body">
-                <div class="title">WITHDRAWAL RECEIPT</div>
-                
-                <div class="info-row">
-                    <span class="info-label">Transaction ID</span>
-                    <span class="info-value" style="font-family: monospace; color: #10b981;">{{ transaction_id }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Status</span>
-                    <span class="info-value"><span class="status-badge">{{ status_display }}</span></span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Request Date</span>
-                    <span class="info-value">{{ requested_at }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Processed Date</span>
-                    <span class="info-value">{{ processed_at }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Confirmed Date</span>
-                    <span class="info-value">{{ confirmed_at }}</span>
-                </div>
-                
-                <div class="amount-row">
-                    <div class="amount-label">AMOUNT WITHDRAWN</div>
-                    <div class="amount-value">GHS {{ amount }}</div>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Payment Method</span>
-                    <span class="info-value">{{ payment_method }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Account Details</span>
-                    <span class="info-value">{{ account_details }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Recipient</span>
-                    <span class="info-value">{{ user_name }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Email</span>
-                    <span class="info-value">{{ user_email }}</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Phone</span>
-                    <span class="info-value">{{ user_phone }}</span>
-                </div>
-                
-                <div class="qr-code">
-                    <img src="data:image/png;base64,{{ qr_base64 }}" alt="Verification QR Code">
-                </div>
-                <div class="verification-note">
-                    Scan QR code or visit {{ verification_url }} to verify this receipt
-                </div>
-                
-                <div class="signature">
-                    <p style="font-size: 11px; color: #0f3b2c;">Authorized by Zivre Finance Department</p>
-                    <p style="font-size: 9px; margin-top: 5px;">This is an electronically generated receipt. No signature required.</p>
-                </div>
-            </div>
-            
-            <div class="footer">
-                <p>Zivre Facility Services • Near S.D.A Church, New Life Road, Pokuase</p>
-                <p>📞 +233 54 346 3686 • ✉️ zivrefaservice@gmail.com</p>
-                <p>© 2025 Zivre Facility Services. All rights reserved.</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    template = Template(html_template)
-    
-    status_display = "Sent - Awaiting Confirmation" if withdrawal.status == 'admin_sent' else "Completed"
-    
-    html_content = template.render(
-        transaction_id=withdrawal.transaction_id,
-        status_display=status_display,
-        requested_at=withdrawal.requested_at.strftime('%Y-%m-%d %H:%M') if withdrawal.requested_at else 'N/A',
-        processed_at=withdrawal.admin_processed_at.strftime('%Y-%m-%d %H:%M') if withdrawal.admin_processed_at else 'N/A',
-        confirmed_at=withdrawal.user_confirmed_at.strftime('%Y-%m-%d %H:%M') if withdrawal.user_confirmed_at else 'Pending',
-        amount=f"{withdrawal.amount:.2f}",
-        payment_method=withdrawal.payment_method.replace('_', ' ').title(),
-        account_details=withdrawal.account_details,
-        user_name=user.full_name,
-        user_email=user.email,
-        user_phone=user.phone,
-        qr_base64=qr_base64,
-        verification_url=verification_url
-    )
-    
-    # Generate PDF
-    pdf_buffer = io.BytesIO()
-    pisa_status = pisa.CreatePDF(html_content, dest=pdf_buffer)
-    
-    if pisa_status.err:
-        return jsonify({'error': 'Failed to generate PDF'}), 500
-    
-    pdf_buffer.seek(0)
-    
-    filename = f"Zivre_Receipt_{withdrawal.transaction_id}.pdf"
-    
-    return send_file(
-        pdf_buffer,
-        as_attachment=True,
-        download_name=filename,
-        mimetype='application/pdf'
-    )
-
-@app.route('/api/referrals/verify-transaction', methods=['POST'])
-def verify_transaction():
-    """Public endpoint to verify a withdrawal receipt by transaction ID"""
-    data = request.json
-    transaction_id = data.get('transaction_id', '').strip().upper()
-    
-    if not transaction_id:
-        return jsonify({'error': 'Transaction ID is required'}), 400
-    
-    # Find withdrawal by transaction_id
-    withdrawal = WithdrawalRequest.query.filter_by(transaction_id=transaction_id).first()
-    
-    if not withdrawal:
-        return jsonify({
-            'valid': False,
-            'message': 'Transaction ID not found. Please check and try again.'
-        }), 404
-    
-    # Only show verified/confirmed withdrawals
-    if withdrawal.status not in ['admin_sent', 'user_confirmed']:
-        return jsonify({
-            'valid': False,
-            'message': 'This transaction has not been processed yet.'
-        }), 400
-    
-    user = db.session.get(User, withdrawal.user_id)
-    
-    return jsonify({
-        'valid': True,
-        'transaction': {
-            'transaction_id': withdrawal.transaction_id,
-            'amount': withdrawal.amount,
-            'status': 'Completed' if withdrawal.status == 'user_confirmed' else 'Processed',
-            'requested_at': withdrawal.requested_at.isoformat(),
-            'processed_at': withdrawal.admin_processed_at.isoformat() if withdrawal.admin_processed_at else None,
-            'confirmed_at': withdrawal.user_confirmed_at.isoformat() if withdrawal.user_confirmed_at else None,
-            'payment_method': withdrawal.payment_method,
-            'recipient_name': user.full_name if user else 'Unknown',
-            'recipient_email': user.email if user else 'Unknown'
-        }
-    })
-
-
 @app.route('/api/referrals/withdrawals/<int:withdrawal_id>/confirm', methods=['PUT'])
 @token_required
 def confirm_withdrawal_receipt(withdrawal_id):
