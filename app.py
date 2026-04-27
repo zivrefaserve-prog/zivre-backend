@@ -2882,22 +2882,43 @@ def get_all_requests():
 def get_available_providers():
     service_id = request.args.get('service_id', type=int)
     
+    # ✅ Only select needed fields - excludes password, email, etc. for SPEED
     if service_id:
-        providers = User.query.filter_by(
-            role='provider', 
-            is_verified=True, 
-            is_active=True,
-            service_specialization_id=service_id
-        ).all()
+        providers = db.session.query(
+            User.id, 
+            User.full_name, 
+            User.rating, 
+            User.total_jobs,
+            Service.name.label('service_specialization')
+        ).join(
+            Service, User.service_specialization_id == Service.id
+        ).filter(
+            User.role == 'provider',
+            User.is_verified == True,
+            User.is_active == True,
+            User.service_specialization_id == service_id
+        ).limit(50).all()  # ✅ Limit to 50 providers for SPEED
     else:
-        providers = User.query.filter_by(role='provider', is_verified=True, is_active=True).all()
+        providers = db.session.query(
+            User.id, 
+            User.full_name, 
+            User.rating, 
+            User.total_jobs,
+            Service.name.label('service_specialization')
+        ).join(
+            Service, User.service_specialization_id == Service.id
+        ).filter(
+            User.role == 'provider',
+            User.is_verified == True,
+            User.is_active == True
+        ).limit(50).all()  # ✅ Limit to 50 providers for SPEED
     
     return jsonify([{
         'id': p.id,
         'full_name': p.full_name,
-        'rating': p.rating,
-        'total_jobs': p.total_jobs,
-        'service_specialization': p.service_specialization.name if p.service_specialization else None
+        'rating': float(p.rating) if p.rating else 0,
+        'total_jobs': p.total_jobs or 0,
+        'service_specialization': p.service_specialization
     } for p in providers])
 
 @app.route('/api/admin/stats', methods=['GET'])
