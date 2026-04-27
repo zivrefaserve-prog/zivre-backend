@@ -2918,52 +2918,46 @@ def delete_user(user_id):
         if user.role == 'admin':
             return jsonify({'error': 'Cannot delete admin user'}), 403
         
-        # Delete related records safely
-        try:
-            ServiceRequest.query.filter_by(user_id=user_id).delete()
-        except Exception as e:
-            print(f"Error deleting service requests: {e}")
-            
-        try:
-            ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
-        except Exception as e:
-            print(f"Error updating provider requests: {e}")
-            
-        try:
-            Notification.query.filter_by(user_id=user_id).delete()
-        except Exception as e:
-            print(f"Error deleting notifications: {e}")
-            
-        try:
-            Message.query.filter((Message.sender_id == user_id) | (Message.receiver_id == user_id)).delete()
-        except Exception as e:
-            print(f"Error deleting messages: {e}")
-            
-        try:
-            Comment.query.filter_by(user_id=user_id).delete()
-        except Exception as e:
-            print(f"Error deleting comments: {e}")
-            
-        try:
-            CommentReply.query.filter_by(user_id=user_id).delete()
-        except Exception as e:
-            print(f"Error deleting comment replies: {e}")
+        # ✅ CRITICAL FIX: Clear referrer_id for all users this user referred
+        # This removes the foreign key constraint violation
+        User.query.filter_by(referrer_id=user_id).update({'referrer_id': None})
         
-        # Also delete commission records
+        # Also clear position for affected users (optional but clean)
+        User.query.filter_by(referrer_id=user_id).update({'position': None})
+        
+        # 1. Delete or update service requests
+        ServiceRequest.query.filter_by(user_id=user_id).delete()
+        ServiceRequest.query.filter_by(provider_id=user_id).update({'provider_id': None})
+        
+        # 2. Delete notifications
+        Notification.query.filter_by(user_id=user_id).delete()
+        
+        # 3. Delete messages
+        Message.query.filter(
+            (Message.sender_id == user_id) | (Message.receiver_id == user_id)
+        ).delete()
+        
+        # 4. Delete comments and replies
+        Comment.query.filter_by(user_id=user_id).delete()
+        CommentReply.query.filter_by(user_id=user_id).delete()
+        
+        # 5. Delete commission records
         try:
             Commission.query.filter_by(user_id=user_id).delete()
         except Exception as e:
             print(f"Error deleting commissions: {e}")
         
-        # Also delete withdrawal requests
+        # 6. Delete withdrawal requests
         try:
             WithdrawalRequest.query.filter_by(user_id=user_id).delete()
         except Exception as e:
             print(f"Error deleting withdrawal requests: {e}")
         
+        # 7. Finally delete the user
         db.session.delete(user)
         db.session.commit()
         
+        # Emit events for real-time updates
         socketio.emit('user_deleted', {'user_id': user_id})
         socketio.emit('users_updated', {})
         
@@ -2971,7 +2965,7 @@ def delete_user(user_id):
         
     except Exception as e:
         db.session.rollback()
-        print(f"Error deleting user {user_id}: {str(e)}")
+        print(f"❌ Error deleting user {user_id}: {str(e)}")
         return jsonify({'error': f'Error deleting user: {str(e)}'}), 500
         
 
