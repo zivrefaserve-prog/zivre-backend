@@ -3250,7 +3250,6 @@ def ping():
 
 # ==================== INITIAL DATA ====================
 # ==================== INITIAL DATA ====================
-
 def init_db():
     db.create_all()
     
@@ -3359,7 +3358,16 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Withdrawal requests table note: {e}")
     
-    # 8. Update existing services with default shares
+    # 8. Add transaction_id to withdrawal_requests (NEW - for receipts)
+    try:
+        db.session.execute(text('ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(50) UNIQUE'))
+        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_transaction_id ON withdrawal_requests(transaction_id)'))
+        db.session.commit()
+        print("✅ transaction_id column added to withdrawal_requests")
+    except Exception as e:
+        print(f"⚠️ transaction_id column note: {e}")
+    
+    # 9. Update existing services with default shares
     try:
         db.session.execute(text('''
             UPDATE services SET 
@@ -3375,7 +3383,7 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Services update note: {e}")
     
-    # 9. Generate referral codes for existing users who don't have one
+    # 10. Generate referral codes for existing users who don't have one
     try:
         db.session.execute(text('''
             UPDATE users SET referral_code = UPPER(SUBSTRING(MD5(id::TEXT) FROM 1 FOR 8))
@@ -3385,10 +3393,6 @@ def init_db():
         print("✅ Referral codes generated for existing users")
     except Exception as e:
         print(f"⚠️ Referral codes note: {e}")
-    
-    # ============================================
-    # END OF REFERRAL SYSTEM MIGRATION
-    # ============================================
     
     # ========== YOUR EXISTING CODE CONTINUES BELOW ==========
     
@@ -3489,17 +3493,17 @@ def init_db():
             role='admin',
             is_verified=True,
             is_active=True,
-            email_verified=True,           # ← ADD THIS
-            verification_token=None,        # ← ADD THIS
-            verification_token_expiry=None  # ← ADD THIS
+            email_verified=True,
+            verification_token=None,
+            verification_token_expiry=None
         )
         db.session.add(admin)
     else:
         admin.is_active = True
         admin.is_verified = True
-        admin.email_verified = True         # ← ADD THIS
-        admin.verification_token = None     # ← ADD THIS
-        admin.verification_token_expiry = None  # ← ADD THIS
+        admin.email_verified = True
+        admin.verification_token = None
+        admin.verification_token_expiry = None
         if not check_password_hash(admin.password, 'Admin123!'):
             admin.password = generate_password_hash('Admin123!')
         db.session.add(admin)
@@ -3517,18 +3521,18 @@ def init_db():
             is_verified=True,
             is_active=True,
             service_specialization_id=hvac_service.id if hvac_service else None,
-            email_verified=True,           # ← ADD THIS
-            verification_token=None,        # ← ADD THIS
-            verification_token_expiry=None  # ← ADD THIS
+            email_verified=True,
+            verification_token=None,
+            verification_token_expiry=None
         )
         db.session.add(sample_provider)
         print("✅ Created new test provider")
     else:
         sample_provider.is_verified = True
         sample_provider.is_active = True
-        sample_provider.email_verified = True      # ← ADD THIS
-        sample_provider.verification_token = None  # ← ADD THIS
-        sample_provider.verification_token_expiry = None  # ← ADD THIS
+        sample_provider.email_verified = True
+        sample_provider.verification_token = None
+        sample_provider.verification_token_expiry = None
         if hvac_service:
             sample_provider.service_specialization_id = hvac_service.id
         sample_provider.password = generate_password_hash('Provider123!')
@@ -3559,6 +3563,7 @@ def init_db():
 
     db.session.commit()
     print("✅ Database initialized successfully!")
+
 
 # ==================== INITIALIZE DATABASE ====================
 with app.app_context():
