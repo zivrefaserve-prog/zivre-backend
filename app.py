@@ -1251,12 +1251,30 @@ def verify_email():
 @app.route('/api/auth/resend-verification', methods=['POST'])
 def resend_verification():
     data = request.json
-    email = data.get('email')
+    new_email = data.get('email')           # The email user typed in the form
+    original_email = data.get('original_email')  # The email from URL param
     
-    if not email:
+    if not new_email:
         return jsonify({'error': 'Email is required'}), 400
     
-    user = User.query.filter_by(email=email).first()
+    # Try to find user by the new email first
+    user = User.query.filter_by(email=new_email).first()
+    
+    # If not found, try to find by original email (the one from signup)
+    if not user and original_email:
+        user = User.query.filter_by(email=original_email).first()
+        
+        # ✅ IF EMAIL HAS CHANGED - UPDATE THE DATABASE!
+        if user and user.email != new_email:
+            # Check if new email is already taken by another user
+            existing_user = User.query.filter_by(email=new_email).first()
+            if existing_user and existing_user.id != user.id:
+                return jsonify({'error': 'Email already in use by another account'}), 400
+            
+            # ✅ CRITICAL FIX: Update the email in database
+            user.email = new_email
+            db.session.commit()
+            print(f"✅ Email updated from {original_email} to {new_email}")
     
     if not user:
         return jsonify({'error': 'User not found'}), 404
@@ -1264,18 +1282,19 @@ def resend_verification():
     if user.email_verified:
         return jsonify({'error': 'Email already verified'}), 400
     
-    # Generate new token
+    # Generate new verification token (old one becomes invalid)
     verification_token = str(uuid.uuid4())
     user.verification_token = verification_token
     user.verification_token_expiry = datetime.utcnow() + timedelta(hours=24)
     db.session.commit()
     
-    # Send new verification email
+    # Send verification email to the (possibly new) email address
     send_verification_email(user.email, user.full_name, verification_token)
     
-    return jsonify({'message': 'Verification email sent. Please check your inbox.'})
-
-
+    return jsonify({
+        'message': f'Verification email sent to {user.email}',
+        'email_updated': True
+    })
     
 @app.route('/api/auth/user/<int:user_id>', methods=['GET'])
 @token_required
