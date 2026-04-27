@@ -3186,6 +3186,7 @@ def ping():
     return jsonify({'message': 'session active', 'user_id': request.current_user.id})
 
 # ==================== INITIAL DATA ====================
+# ==================== INITIAL DATA ====================
 
 def init_db():
     db.create_all()
@@ -3243,7 +3244,6 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Service requests columns note: {e}")
 
-        
     # 5. Add email verification columns to users table
     try:
         db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false'))
@@ -3416,89 +3416,76 @@ def init_db():
             db.session.add(service)
             created_services.append(service)
     
-admin = User.query.filter_by(email='admin@zivre.com').first()
-if not admin:
-    admin = User(
-        email='admin@zivre.com',
-        password=generate_password_hash('Admin123!'),
-        full_name='Admin User',
-        phone='+233000000000',
-        role='admin',
-        is_verified=True,
-        is_active=True,
-        email_verified=True,
-        verification_token=None,
-        verification_token_expiry=None
-    )
-    db.session.add(admin)
-else:
-    # Update existing admin
-    admin.is_active = True
-    admin.is_verified = True
-    admin.email_verified = True
-    admin.verification_token = None
-    admin.verification_token_expiry = None
-    if not check_password_hash(admin.password, 'Admin123!'):
-        admin.password = generate_password_hash('Admin123!')
-    db.session.add(admin)
-
-hvac_service = Service.query.filter_by(name='HVAC Systems').first()
-
-sample_provider = User.query.filter_by(email='provider@test.com').first()
-if not sample_provider:
-    sample_provider = User(
-        email='provider@test.com',
-        password=generate_password_hash('Provider123!'),
-        full_name='Test Provider',
-        phone='+233500000000',
-        role='provider',
-        is_verified=True,
-        is_active=True,
-        service_specialization_id=hvac_service.id if hvac_service else None,
-        email_verified=True,
-        verification_token=None,
-        verification_token_expiry=None
-    )
-    db.session.add(sample_provider)
-else:
-    # Update existing provider
-    sample_provider.is_verified = True
-    sample_provider.is_active = True
-    sample_provider.email_verified = True
-    sample_provider.verification_token = None
-    sample_provider.verification_token_expiry = None
-    if hvac_service:
-        sample_provider.service_specialization_id = hvac_service.id
-    if not check_password_hash(sample_provider.password, 'Provider123!'):
+    admin = User.query.filter_by(email='admin@zivre.com').first()
+    if not admin:
+        admin = User(
+            email='admin@zivre.com',
+            password=generate_password_hash('Admin123!'),
+            full_name='Admin User',
+            phone='+233000000000',
+            role='admin',
+            is_verified=True,
+            is_active=True
+        )
+        db.session.add(admin)
+    else:
+        admin.is_active = True
+        admin.is_verified = True
+        if not check_password_hash(admin.password, 'Admin123!'):
+            admin.password = generate_password_hash('Admin123!')
+        db.session.add(admin)
+    
+    hvac_service = Service.query.filter_by(name='HVAC Systems').first()
+    
+    sample_provider = User.query.filter_by(email='provider@test.com').first()
+    if not sample_provider:
+        sample_provider = User(
+            email='provider@test.com',
+            password=generate_password_hash('Provider123!'),
+            full_name='Test Provider',
+            phone='+233500000000',
+            role='provider',
+            is_verified=True,
+            is_active=True,
+            service_specialization_id=hvac_service.id if hvac_service else None
+        )
+        db.session.add(sample_provider)
+        print("✅ Created new test provider")
+    else:
+        sample_provider.is_verified = True
+        sample_provider.is_active = True
+        if hvac_service:
+            sample_provider.service_specialization_id = hvac_service.id
         sample_provider.password = generate_password_hash('Provider123!')
-    db.session.add(sample_provider)
-    print("✅ Updated existing test provider with correct password")
+        db.session.add(sample_provider)
+        print("✅ Updated existing test provider with correct password")
+    
+    db.session.commit()
+    
+    payment_number = SystemSetting.query.filter_by(key='payment_number').first()
+    if not payment_number:
+        payment_number = SystemSetting(key='payment_number', value='024 000 0000')
+        db.session.add(payment_number)
+    
+    momopay_number = SystemSetting.query.filter_by(key='momopay_number').first()
+    if not momopay_number:
+        momopay_number = SystemSetting(key='momopay_number', value='024 000 0000')
+        db.session.add(momopay_number)
+    
+    support_number = SystemSetting.query.filter_by(key='support_number').first()
+    if not support_number:
+        support_number = SystemSetting(key='support_number', value='050 000 0000')
+        db.session.add(support_number)
+    
+    whatsapp_number = SystemSetting.query.filter_by(key='whatsapp_number').first()
+    if not whatsapp_number:
+        whatsapp_number = SystemSetting(key='whatsapp_number', value='233500000000')
+        db.session.add(whatsapp_number)
 
-db.session.commit()
+    db.session.commit()
+    print("✅ Database initialized successfully!")
 
-payment_number = SystemSetting.query.filter_by(key='payment_number').first()
-if not payment_number:
-    payment_number = SystemSetting(key='payment_number', value='024 000 0000')
-    db.session.add(payment_number)
-
-momopay_number = SystemSetting.query.filter_by(key='momopay_number').first()
-if not momopay_number:
-    momopay_number = SystemSetting(key='momopay_number', value='024 000 0000')
-    db.session.add(momopay_number)
-
-support_number = SystemSetting.query.filter_by(key='support_number').first()
-if not support_number:
-    support_number = SystemSetting(key='support_number', value='050 000 0000')
-    db.session.add(support_number)
-
-whatsapp_number = SystemSetting.query.filter_by(key='whatsapp_number').first()
-if not whatsapp_number:
-    whatsapp_number = SystemSetting(key='whatsapp_number', value='233500000000')
-    db.session.add(whatsapp_number)
-
-db.session.commit()
-print("✅ Database initialized successfully!")
-
+# ==================== INITIALIZE DATABASE ====================
 with app.app_context():
     init_db()
 
