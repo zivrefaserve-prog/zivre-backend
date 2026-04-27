@@ -1077,19 +1077,19 @@ def signup():
     # Send verification email
     send_verification_email(new_user.email, new_user.full_name, verification_token)
     
-    # Return response WITHOUT auto-login (they need to verify first)
-    return jsonify({
-        'message': 'Registration successful! Please check your email to verify your account.',
-        'requires_verification': True,
-        'email': new_user.email
-    }), 201
-
     # If user signed up with a referral code, notify the referrer to update their tree
     if referrer_id:
         socketio.emit('referral_tree_updated', {
             'user_id': referrer_id,
             'new_user_id': new_user.id
         }, room=f"user_{referrer_id}")
+    
+    # Return response WITHOUT auto-login (they need to verify first)
+    return jsonify({
+        'message': 'Registration successful! Please check your email to verify your account.',
+        'requires_verification': True,
+        'email': new_user.email
+    }), 201
         
     # Generate JWT token for auto-login
     token = jwt.encode({
