@@ -3504,8 +3504,8 @@ def init_db():
         admin.email_verified = True
         admin.verification_token = None
         admin.verification_token_expiry = None
-        if not check_password_hash(admin.password, 'Admin123!'):
-            admin.password = generate_password_hash('Admin123!')
+        # FIX: Always regenerate password to ensure it's valid
+        admin.password = generate_password_hash('Admin123!')
         db.session.add(admin)
     
     hvac_service = Service.query.filter_by(name='HVAC Systems').first()
@@ -3535,9 +3535,11 @@ def init_db():
         sample_provider.verification_token_expiry = None
         if hvac_service:
             sample_provider.service_specialization_id = hvac_service.id
+        # FIX: Always regenerate password to ensure it's valid
         sample_provider.password = generate_password_hash('Provider123!')
         db.session.add(sample_provider)
         print("✅ Updated existing test provider with correct password")
+
     
     db.session.commit()
     
