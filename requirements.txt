@@ -16,3 +16,4 @@ gunicorn==21.2.0
 gevent==24.2.1
 PyJWT==2.8.0
 sendgrid==6.10.0
+brevo-python==1.0.0
