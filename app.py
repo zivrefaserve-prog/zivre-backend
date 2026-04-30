@@ -22,8 +22,8 @@ from flask_limiter.util import get_remote_address
 from sqlalchemy import text
 import mimetypes
 import jwt
-import brevo_python
-from brevo_python.rest import ApiException
+import sendgrid
+from sendgrid.helpers.mail import Mail
 
 load_dotenv()
 
@@ -464,7 +464,6 @@ def get_current_percentages():
     return setting
 
 # ==================== EMAIL HELPER FUNCTION ====================
-# ==================== EMAIL HELPER FUNCTIONS (BREVO) ====================
 def send_verification_email(user_email, user_name, verification_token):
     try:
         frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
@@ -475,60 +474,46 @@ def send_verification_email(user_email, user_name, verification_token):
         print(f"{verification_link}")
         print(f"{'='*60}\n")
         
-        # Configure Brevo API
-        configuration = brevo_python.Configuration()
-        configuration.api_key['api-key'] = os.environ.get('BREVO_API_KEY')
-        
-        api_instance = brevo_python.TransactionalEmailsApi(brevo_python.ApiClient(configuration))
-        
-        subject = "Verify Your Zivre Email Address"
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
         
         html_content = f"""
         <!DOCTYPE html>
         <html>
-        <head>
-            <meta charset="UTF-8">
-            <meta name="format-detection" content="telephone=no">
-        </head>
-        <body style="font-family: Arial, sans-serif; margin: 0; padding: 0;">
-            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #10b981; border-radius: 10px; background-color: #ffffff;">
-                <h2 style="color: #10b981; margin-bottom: 20px;">Welcome to Zivre!</h2>
-                <p style="margin-bottom: 20px;">Hello <strong>{user_name}</strong>,</p>
-                <p style="margin-bottom: 20px;">Please verify your email address to complete your registration:</p>
-                <a href="{verification_link}" style="display: inline-block; background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; margin: 20px 0;">Verify Email Address</a>
-                <p style="margin-bottom: 10px;">Or copy this link: <strong style="color: #10b981; word-break: break-all;">{verification_link}</strong></p>
-                <p style="margin-bottom: 10px;">This link expires in <strong>24 hours</strong>.</p>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #e2e8f0;">
-                <p style="color: #64748b; font-size: 12px; margin: 0;">
-                    Zivre Facility Services - Professional facility management across Ghana<br>
-                    If you didn't create an account, please ignore this email.
-                </p>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #10b981; border-radius: 10px;">
+                <h2 style="color: #10b981;">Welcome to Zivre!</h2>
+                <p>Hello {user_name},</p>
+                <p>Please verify your email address:</p>
+                <a href="{verification_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Verify Email</a>
+                <p>Or copy: <strong>{verification_link}</strong></p>
+                <p>Expires in 24 hours.</p>
             </div>
         </body>
         </html>
         """
         
-        send_smtp_email = brevo_python.SendSmtpEmail(
-            to=[{"email": user_email, "name": user_name}],
-            sender={"email": "zivrefaserve@gmail.com", "name": "Zivre Facility Services"},
-            subject=subject,
+        message = Mail(
+            from_email="zivrefaserve@gmail.com",
+            to_emails=user_email,
+            subject="Verify Your Zivre Email Address",
             html_content=html_content
         )
         
-        api_response = api_instance.send_transac_email(send_smtp_email)
-        print(f"✅ Verification email sent to {user_email} via Brevo")
+        response = sg.send(message)
+        
+        if response.status_code == 202:
+            print(f"✅ Verification email sent to {user_email}")
+        else:
+            print(f"⚠️ SendGrid status: {response.status_code}")
+        
         return True
         
-    except ApiException as e:
-        print(f"❌ Brevo API error: {e}")
-        print(f"📧 Manual verification link: {verification_link}")
-        return True
     except Exception as e:
-        print(f"❌ Unexpected error: {str(e)}")
-        print(f"📧 Manual verification link: {verification_link}")
+        print(f"❌ SendGrid error: {str(e)}")
+        print(f"📧 Manual link: {verification_link}")
         return True
 
-
+# Same function for password reset
 def send_reset_email(user_email, user_name, reset_token):
     try:
         frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
@@ -539,54 +524,35 @@ def send_reset_email(user_email, user_name, reset_token):
         print(f"{reset_link}")
         print(f"{'='*60}\n")
         
-        # Configure Brevo API
-        configuration = brevo_python.Configuration()
-        configuration.api_key['api-key'] = os.environ.get('BREVO_API_KEY')
-        
-        api_instance = brevo_python.TransactionalEmailsApi(brevo_python.ApiClient(configuration))
-        
-        subject = "Reset Your Zivre Password"
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
         
         html_content = f"""
         <!DOCTYPE html>
         <html>
-        <head>
-            <meta charset="UTF-8">
-            <meta name="format-detection" content="telephone=no">
-        </head>
-        <body style="font-family: Arial, sans-serif; margin: 0; padding: 0;">
-            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #10b981; border-radius: 10px; background-color: #ffffff;">
-                <h2 style="color: #10b981; margin-bottom: 20px;">Reset Your Password</h2>
-                <p style="margin-bottom: 20px;">Hello <strong>{user_name}</strong>,</p>
-                <p style="margin-bottom: 20px;">We received a request to reset your password. Click the button below to create a new password:</p>
-                <a href="{reset_link}" style="display: inline-block; background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; margin: 20px 0;">Reset Password</a>
-                <p style="margin-bottom: 10px;">Or copy this link: <strong style="color: #10b981; word-break: break-all;">{reset_link}</strong></p>
-                <p style="margin-bottom: 10px;">This link expires in <strong>1 hour</strong>.</p>
-                <p>If you didn't request this, please ignore this email.</p>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #e2e8f0;">
-                <p style="color: #64748b; font-size: 12px; margin: 0;">Zivre Facility Services - Professional facility management across Ghana</p>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #10b981;">Reset Your Password</h2>
+                <p>Hello {user_name},</p>
+                <a href="{reset_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px;">Reset Password</a>
+                <p>Expires in 1 hour.</p>
             </div>
         </body>
         </html>
         """
         
-        send_smtp_email = brevo_python.SendSmtpEmail(
-            to=[{"email": user_email, "name": user_name}],
-            sender={"email": "zivrefaserve@gmail.com", "name": "Zivre Facility Services"},
-            subject=subject,
+        message = Mail(
+            from_email="zivrefaserve@gmail.com",
+            to_emails=user_email,
+            subject="Reset Your Zivre Password",
             html_content=html_content
         )
         
-        api_response = api_instance.send_transac_email(send_smtp_email)
-        print(f"✅ Password reset email sent to {user_email} via Brevo")
+        response = sg.send(message)
+        print(f"✅ Reset email sent to {user_email}")
         return True
         
-    except ApiException as e:
-        print(f"❌ Brevo API error: {e}")
-        print(f"🔐 Manual reset link: {reset_link}")
-        return True
     except Exception as e:
-        print(f"❌ Unexpected error: {str(e)}")
+        print(f"❌ SendGrid error: {str(e)}")
         print(f"🔐 Manual reset link: {reset_link}")
         return True
 # ==================== WEBSOCKET EVENTS ====================
