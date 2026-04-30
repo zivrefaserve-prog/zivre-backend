@@ -504,8 +504,7 @@ def send_reset_email(user_email, user_name, reset_token):
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
         
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-        server.starttls()
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
         server.login(smtp_username, smtp_password)
         server.send_message(msg)
         server.quit()
