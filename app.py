@@ -474,9 +474,9 @@ def send_reset_email(user_email, user_name, reset_token):
         print(f"{'='*60}\n")
         
         smtp_server = "smtp.gmail.com"
-        smtp_port = 587
+        smtp_port = 465
         smtp_username = "zivrefaserve@gmail.com"
-        smtp_password = "jmivcbvhipysvgcl"
+        smtp_password = "ntqwqdnjnmpepudt"
         
         subject = "Reset Your Zivre Password"
         
@@ -531,7 +531,7 @@ def send_verification_email(user_email, user_name, verification_token):
         smtp_server = "smtp.gmail.com"
         smtp_port = 465
         smtp_username = "zivrefaserve@gmail.com"
-        smtp_password = os.environ.get('SMTP_PASSWORD', 'jmivcbvhipysvgcl')
+        smtp_password = os.environ.get('SMTP_PASSWORD', 'ntqwqdnjnmpepudt')
         
         subject = "Verify Your Zivre Email Address"
         
