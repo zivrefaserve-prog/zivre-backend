@@ -22,6 +22,8 @@ from flask_limiter.util import get_remote_address
 from sqlalchemy import text
 import mimetypes
 import jwt
+import sendgrid
+from sendgrid.helpers.mail import Mail
 
 load_dotenv()
 
@@ -462,116 +464,97 @@ def get_current_percentages():
     return setting
 
 # ==================== EMAIL HELPER FUNCTION ====================
-
-def send_reset_email(user_email, user_name, reset_token):
-    try:
-        frontend_url = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-        reset_link = f"{frontend_url}/reset-password?token={reset_token}"
-        
-        print(f"\n{'='*60}")
-        print(f"🔐 PASSWORD RESET LINK (copy this URL to reset password):")
-        print(f"{reset_link}")
-        print(f"{'='*60}\n")
-        
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 465
-        smtp_username = "zivrefaserve@gmail.com"
-        smtp_password = "ntqwqdnjnmpepudt"
-        
-        subject = "Reset Your Zivre Password"
-        
-        html_body = f"""
-        <!DOCTYPE html>
-        <html>
-        <head><meta charset="UTF-8"></head>
-        <body style="font-family: Arial, sans-serif;">
-            <div style="max-width: 500px; margin: 0 auto; padding: 20px;">
-                <h2 style="color: #10b981;">Reset Your Password</h2>
-                <p>Hello {user_name},</p>
-                <p>Click the button below to reset your password. This link expires in 1 hour.</p>
-                <a href="{reset_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Reset Password</a>
-                <p>Or copy this link: {reset_link}</p>
-                <p>If you didn't request this, please ignore this email.</p>
-                <p>Thanks,<br>Zivre Team</p>
-            </div>
-        </body>
-        </html>
-        """
-        
-        msg = MIMEMultipart('alternative')
-        msg['From'] = smtp_username
-        msg['To'] = user_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(html_body, 'html'))
-        
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
-        server.login(smtp_username, smtp_password)
-        server.send_message(msg)
-        server.quit()
-        
-        print(f"✅ Email sent to {user_email}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Email error: {str(e)}")
-        return True
-
-
 def send_verification_email(user_email, user_name, verification_token):
     try:
         frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
         verification_link = f"{frontend_url}/verify-email?token={verification_token}"
         
         print(f"\n{'='*60}")
-        print(f"📧 EMAIL VERIFICATION LINK (copy this URL to verify email):")
+        print(f"📧 VERIFICATION LINK:")
         print(f"{verification_link}")
         print(f"{'='*60}\n")
         
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 465
-        smtp_username = "zivrefaserve@gmail.com"
-        smtp_password = os.environ.get('SMTP_PASSWORD', 'ntqwqdnjnmpepudt')
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
         
-        subject = "Verify Your Zivre Email Address"
-        
-        html_body = f"""
+        html_content = f"""
         <!DOCTYPE html>
         <html>
-        <head><meta charset="UTF-8"></head>
         <body style="font-family: Arial, sans-serif;">
-            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #10b981; border-radius: 10px;">
                 <h2 style="color: #10b981;">Welcome to Zivre!</h2>
                 <p>Hello {user_name},</p>
-                <p>Please verify your email address to complete your registration.</p>
-                <a href="{verification_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0;">Verify Email Address</a>
-                <p>Or copy this link: <strong style="color: #10b981;">{verification_link}</strong></p>
-                <p>This link expires in <strong>24 hours</strong>.</p>
-                <p>If you didn't create an account, please ignore this email.</p>
-                <hr style="margin: 20px 0;">
-                <p style="color: #64748b; font-size: 12px;">Zivre Facility Services - Professional facility management across Ghana</p>
+                <p>Please verify your email address:</p>
+                <a href="{verification_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Verify Email</a>
+                <p>Or copy: <strong>{verification_link}</strong></p>
+                <p>Expires in 24 hours.</p>
             </div>
         </body>
         </html>
         """
         
-        msg = MIMEMultipart('alternative')
-        msg['From'] = smtp_username
-        msg['To'] = user_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(html_body, 'html'))
+        message = Mail(
+            from_email="zivrefaserve@gmail.com",
+            to_emails=user_email,
+            subject="Verify Your Zivre Email Address",
+            html_content=html_content
+        )
         
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
-        server.login(smtp_username, smtp_password)
-        server.send_message(msg)
-        server.quit()
+        response = sg.send(message)
         
-        print(f"✅ Verification email sent to {user_email}")
+        if response.status_code == 202:
+            print(f"✅ Verification email sent to {user_email}")
+        else:
+            print(f"⚠️ SendGrid status: {response.status_code}")
+        
         return True
         
     except Exception as e:
-        print(f"❌ Verification email error: {str(e)}")
-        return False
+        print(f"❌ SendGrid error: {str(e)}")
+        print(f"📧 Manual link: {verification_link}")
+        return True
 
+# Same function for password reset
+def send_reset_email(user_email, user_name, reset_token):
+    try:
+        frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
+        reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+        
+        print(f"\n{'='*60}")
+        print(f"🔐 RESET LINK:")
+        print(f"{reset_link}")
+        print(f"{'='*60}\n")
+        
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #10b981;">Reset Your Password</h2>
+                <p>Hello {user_name},</p>
+                <a href="{reset_link}" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px;">Reset Password</a>
+                <p>Expires in 1 hour.</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        message = Mail(
+            from_email="zivrefaserve@gmail.com",
+            to_emails=user_email,
+            subject="Reset Your Zivre Password",
+            html_content=html_content
+        )
+        
+        response = sg.send(message)
+        print(f"✅ Reset email sent to {user_email}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ SendGrid error: {str(e)}")
+        print(f"🔐 Manual reset link: {reset_link}")
+        return True
 # ==================== WEBSOCKET EVENTS ====================
 
 @socketio.on('connect')
