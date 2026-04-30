@@ -529,7 +529,7 @@ def send_verification_email(user_email, user_name, verification_token):
         print(f"{'='*60}\n")
         
         smtp_server = "smtp.gmail.com"
-        smtp_port = 587
+        smtp_port = 465
         smtp_username = "zivrefaserve@gmail.com"
         smtp_password = os.environ.get('SMTP_PASSWORD', 'jmivcbvhipysvgcl')
         
@@ -561,8 +561,7 @@ def send_verification_email(user_email, user_name, verification_token):
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
         
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-        server.starttls()
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
         server.login(smtp_username, smtp_password)
         server.send_message(msg)
         server.quit()
