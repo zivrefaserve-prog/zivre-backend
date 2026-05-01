@@ -1000,25 +1000,20 @@ def login():
     })
 
 
+
 @app.route('/api/auth/signup', methods=['POST'])
 @limiter.limit("10 per minute")
 def signup():
     data = request.json
     email = data.get('email')
     
-    # Check if user already exists and is verified
+    # Check if user already exists AND is verified
     existing_user = User.query.filter_by(email=email).first()
     if existing_user and existing_user.email_verified:
         return jsonify({'error': 'Email already exists and is verified'}), 400
     
-    # Check if there's a pending verification that's not expired
-    pending = PendingVerification.query.filter_by(email=email).first()
-    if pending and pending.expires_at > datetime.utcnow():
-        return jsonify({
-            'error': 'A verification email has already been sent. Please check your email or wait for it to expire.',
-            'requires_verification': True,
-            'email': email
-        }), 400
+    # ✅ NO BLOCKING - Just delete any existing pending record
+    PendingVerification.query.filter_by(email=email).delete()
     
     if not validate_email(email):
         return jsonify({'error': 'Invalid email format'}), 400
@@ -1044,9 +1039,6 @@ def signup():
     verification_token = str(uuid.uuid4())
     verification_expiry = datetime.utcnow() + timedelta(hours=24)
     
-    # Delete any existing pending record for this email
-    PendingVerification.query.filter_by(email=email).delete()
-    
     # Store in pending table (NOT in users table yet)
     pending_user = PendingVerification(
         email=email,
@@ -1071,7 +1063,6 @@ def signup():
         'requires_verification': True,
         'email': email
     }), 201
-
    
 
 
