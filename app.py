@@ -373,6 +373,21 @@ class WithdrawalRequest(db.Model):
     admin_notes = db.Column(db.String(500))
     
     user = db.relationship('User', foreign_keys=[user_id])
+
+class PendingVerification(db.Model):
+    __tablename__ = 'pending_verifications'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    full_name = db.Column(db.String(100), nullable=False)
+    phone = db.Column(db.String(20), nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    service_specialization_id = db.Column(db.Integer, nullable=True)
+    referral_code = db.Column(db.String(32), nullable=True)
+    verification_token = db.Column(db.String(100), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    
 # ==================== HELPER FUNCTIONS ====================
 
 def allowed_file(filename):
@@ -985,16 +1000,27 @@ def login():
     })
 
 
-
 @app.route('/api/auth/signup', methods=['POST'])
 @limiter.limit("10 per minute")
 def signup():
     data = request.json
+    email = data.get('email')
     
-    if User.query.filter_by(email=data.get('email')).first():
-        return jsonify({'error': 'Email already exists'}), 400
+    # Check if user already exists and is verified
+    existing_user = User.query.filter_by(email=email).first()
+    if existing_user and existing_user.email_verified:
+        return jsonify({'error': 'Email already exists and is verified'}), 400
     
-    if not validate_email(data.get('email')):
+    # Check if there's a pending verification that's not expired
+    pending = PendingVerification.query.filter_by(email=email).first()
+    if pending and pending.expires_at > datetime.utcnow():
+        return jsonify({
+            'error': 'A verification email has already been sent. Please check your email or wait for it to expire.',
+            'requires_verification': True,
+            'email': email
+        }), 400
+    
+    if not validate_email(email):
         return jsonify({'error': 'Invalid email format'}), 400
     
     is_valid, password_msg = validate_password(data.get('password'))
@@ -1002,7 +1028,6 @@ def signup():
         return jsonify({'error': password_msg}), 400
     
     hashed_password = generate_password_hash(data.get('password'))
-    
     service_specialization_id = data.get('service_specialization')
     
     if data.get('role') == 'provider' and service_specialization_id:
@@ -1013,88 +1038,40 @@ def signup():
             return jsonify({'error': 'Selected service is not active'}), 400
     
     # Handle referral code
-    referrer_id = None
-    position = None
     referral_code_input = data.get('referral_code')
-    
-    if referral_code_input:
-        referrer = User.query.filter_by(referral_code=referral_code_input).first()
-        if referrer:
-            referrer_id = referrer.id
-            children_count = User.query.filter_by(referrer_id=referrer.id).count()
-            if children_count == 0:
-                position = 'left'
-            elif children_count == 1:
-                position = 'center'
-            elif children_count == 2:
-                position = 'right'
-            else:
-                return jsonify({'error': 'This referrer already has maximum children (3)'}), 400
     
     # Generate verification token
     verification_token = str(uuid.uuid4())
     verification_expiry = datetime.utcnow() + timedelta(hours=24)
     
-    new_user = User(
-        email=data.get('email'),
-        password=hashed_password,
+    # Delete any existing pending record for this email
+    PendingVerification.query.filter_by(email=email).delete()
+    
+    # Store in pending table (NOT in users table yet)
+    pending_user = PendingVerification(
+        email=email,
         full_name=data.get('full_name'),
         phone=data.get('phone'),
+        password=hashed_password,
         role=data.get('role', 'customer'),
         service_specialization_id=service_specialization_id if data.get('role') == 'provider' else None,
-        is_verified=False if data.get('role') == 'provider' else False,  # ← Changed: ALL users need email verification
-        is_referral_active=False,
-        referral_code=generate_referral_code(),
-        referrer_id=referrer_id,
-        position=position,
-        email_verified=False,  # ← NEW: Not verified yet
-        verification_token=verification_token,  # ← NEW
-        verification_token_expiry=verification_expiry  # ← NEW
+        referral_code=referral_code_input,
+        verification_token=verification_token,
+        expires_at=verification_expiry
     )
     
-    db.session.add(new_user)
+    db.session.add(pending_user)
     db.session.commit()
     
     # Send verification email
-    send_verification_email(new_user.email, new_user.full_name, verification_token)
+    send_verification_email(email, data.get('full_name'), verification_token)
     
-    # If user signed up with a referral code, notify the referrer to update their tree
-    if referrer_id:
-        socketio.emit('referral_tree_updated', {
-            'user_id': referrer_id,
-            'new_user_id': new_user.id
-        }, room=f"user_{referrer_id}")
-    
-    # Return response WITHOUT auto-login (they need to verify first)
     return jsonify({
-        'message': 'Registration successful! Please check your email to verify your account.',
+        'message': 'Verification email sent! Please check your email to complete registration.',
         'requires_verification': True,
-        'email': new_user.email
+        'email': email
     }), 201
-        
-    # Generate JWT token for auto-login
-    token = jwt.encode({
-        'user_id': new_user.id,
-        'email': new_user.email,
-        'role': new_user.role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    }, JWT_SECRET, algorithm='HS256')
-    
-    return jsonify({
-        'message': 'User created successfully',
-        'token': token,
-        'user': {
-            'id': new_user.id,
-            'email': new_user.email,
-            'full_name': new_user.full_name,
-            'role': new_user.role,
-            'service_specialization': new_user.service_specialization.name if new_user.service_specialization else None,
-            'referral_code': new_user.referral_code,
-            'is_referral_active': new_user.is_referral_active,  # ← FIXED: was 'is_active'
-            'commission_balance': float(new_user.commission_balance or 0)
-        }
-    })
-  
+
    
 
 
@@ -1189,7 +1166,6 @@ def reset_password():
     
     return jsonify({'message': 'Password reset successfully'})
 
-
 @app.route('/api/auth/verify-email', methods=['POST'])
 def verify_email():
     data = request.json
@@ -1200,82 +1176,118 @@ def verify_email():
     if not token:
         return jsonify({'error': 'Verification token is required'}), 400
     
-    user = User.query.filter_by(verification_token=token).first()
+    # Find pending verification
+    pending = PendingVerification.query.filter_by(verification_token=token).first()
     
-    if not user:
-        return jsonify({'error': 'Invalid verification token'}), 400
+    if not pending:
+        return jsonify({'error': 'Invalid or expired verification token'}), 400
     
-    if user.email_verified:
-        return jsonify({'message': 'Email already verified. You can now login.'}), 200
+    if pending.expires_at < datetime.utcnow():
+        db.session.delete(pending)
+        db.session.commit()
+        return jsonify({'error': 'Verification link has expired. Please sign up again.'}), 400
     
-    if user.verification_token_expiry < datetime.utcnow():
-        return jsonify({'error': 'Verification link has expired. Please request a new one.'}), 400
+    # Check if user already exists
+    existing_user = User.query.filter_by(email=pending.email).first()
+    if existing_user:
+        if existing_user.email_verified:
+            db.session.delete(pending)
+            db.session.commit()
+            return jsonify({'message': 'Email already verified. You can now login.'}), 200
+        else:
+            existing_user.email_verified = True
+            existing_user.verification_token = None
+            existing_user.verification_token_expiry = None
+            if existing_user.role == 'customer':
+                existing_user.is_verified = True
+            db.session.delete(pending)
+            db.session.commit()
+            return jsonify({'message': 'Email verified successfully! You can now login.', 'verified': True})
     
-    # Verify the email
-    user.email_verified = True
-    user.verification_token = None
-    user.verification_token_expiry = None
+    # Handle referral code
+    referrer_id = None
+    position = None
+    if pending.referral_code:
+        referrer = User.query.filter_by(referral_code=pending.referral_code).first()
+        if referrer:
+            referrer_id = referrer.id
+            children_count = User.query.filter_by(referrer_id=referrer.id).count()
+            if children_count == 0:
+                position = 'left'
+            elif children_count == 1:
+                position = 'center'
+            elif children_count == 2:
+                position = 'right'
     
-    # If user is a customer, they are now active
-    if user.role == 'customer':
-        user.is_verified = True
+    # Create actual user NOW (only after verification)
+    new_user = User(
+        email=pending.email,
+        password=pending.password,
+        full_name=pending.full_name,
+        phone=pending.phone,
+        role=pending.role,
+        service_specialization_id=pending.service_specialization_id,
+        is_verified=True if pending.role == 'customer' else False,
+        is_referral_active=False,
+        referral_code=generate_referral_code(),
+        referrer_id=referrer_id,
+        position=position,
+        email_verified=True,
+        verification_token=None,
+        verification_token_expiry=None
+    )
     
+    db.session.add(new_user)
     db.session.commit()
     
-    print(f"✅ Email verified for user: {user.email}")
+    # Notify referrer if exists
+    if referrer_id:
+        socketio.emit('referral_tree_updated', {
+            'user_id': referrer_id,
+            'new_user_id': new_user.id
+        }, room=f"user_{referrer_id}")
+    
+    # Delete pending record
+    db.session.delete(pending)
+    db.session.commit()
+    
+    print(f"✅ User created and email verified: {pending.email}")
     
     return jsonify({
-        'message': 'Email verified successfully! You can now login.',
+        'message': 'Email verified successfully! Your account has been created. You can now login.',
         'verified': True
     })
 
 @app.route('/api/auth/resend-verification', methods=['POST'])
 def resend_verification():
     data = request.json
-    new_email = data.get('email')           # The email user typed in the form
-    original_email = data.get('original_email')  # The email from URL param
+    email = data.get('email')
     
-    if not new_email:
+    if not email:
         return jsonify({'error': 'Email is required'}), 400
     
-    # Try to find user by the new email first
-    user = User.query.filter_by(email=new_email).first()
-    
-    # If not found, try to find by original email (the one from signup)
-    if not user and original_email:
-        user = User.query.filter_by(email=original_email).first()
-        
-        # ✅ IF EMAIL HAS CHANGED - UPDATE THE DATABASE!
-        if user and user.email != new_email:
-            # Check if new email is already taken by another user
-            existing_user = User.query.filter_by(email=new_email).first()
-            if existing_user and existing_user.id != user.id:
-                return jsonify({'error': 'Email already in use by another account'}), 400
-            
-            # ✅ CRITICAL FIX: Update the email in database
-            user.email = new_email
-            db.session.commit()
-            print(f"✅ Email updated from {original_email} to {new_email}")
-    
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    if user.email_verified:
+    # Check if user already verified
+    user = User.query.filter_by(email=email).first()
+    if user and user.email_verified:
         return jsonify({'error': 'Email already verified'}), 400
     
-    # Generate new verification token (old one becomes invalid)
-    verification_token = str(uuid.uuid4())
-    user.verification_token = verification_token
-    user.verification_token_expiry = datetime.utcnow() + timedelta(hours=24)
+    # Find pending verification
+    pending = PendingVerification.query.filter_by(email=email).first()
+    
+    if not pending:
+        return jsonify({'error': 'No pending verification found. Please sign up again.'}), 404
+    
+    # Generate new token
+    new_token = str(uuid.uuid4())
+    pending.verification_token = new_token
+    pending.expires_at = datetime.utcnow() + timedelta(hours=24)
     db.session.commit()
     
-    # Send verification email to the (possibly new) email address
-    send_verification_email(user.email, user.full_name, verification_token)
+    # Resend email
+    send_verification_email(pending.email, pending.full_name, new_token)
     
-    return jsonify({
-        'message': f'Verification email sent to {user.email}',
-        'email_updated': True
-    })
+    return jsonify({'message': f'Verification email sent to {email}'})
+
     
 @app.route('/api/auth/user/<int:user_id>', methods=['GET'])
 @token_required
