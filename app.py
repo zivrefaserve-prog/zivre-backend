@@ -92,10 +92,12 @@ socketio = SocketIO(app,
 )
 
 # Configure CORS properly
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://zivre-frontend.vercel.app').split(',')
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS',
+    'https://zivre-frontend.vercel.app,http://localhost:5173'
+).split(',')
 
-CORS(app, 
-     supports_credentials=True, 
+CORS(app,
+     supports_credentials=True,
      origins=ALLOWED_ORIGINS,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"],
      expose_headers=["Content-Type", "Set-Cookie"],
@@ -142,11 +144,12 @@ def admin_required(f):
 def after_request(response):
     origin = request.headers.get('Origin')
     if origin == 'https://zivre-frontend.vercel.app':
-        response.headers.add('Access-Control-Allow-Origin', origin)
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        response.headers['Access-Control-Allow-Origin'] = origin
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
     return response
+
 
 # ==================== DATABASE MODELS ====================
 
@@ -161,6 +164,8 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, default=True)
     is_verified = db.Column(db.Boolean, default=False)
     rating = db.Column(db.Float, default=0)
+    direct_referral_count = db.Column(db.Integer, default=0)
+    referral_level = db.Column(db.Integer, default=1)
     total_jobs = db.Column(db.Integer, default=0)
     reset_token = db.Column(db.String(100), nullable=True)
     reset_expiry = db.Column(db.DateTime, nullable=True)
@@ -185,6 +190,21 @@ class User(db.Model):
     verification_token_expiry = db.Column(db.DateTime, nullable=True)
     
     service_specialization = db.relationship('Service', foreign_keys=[service_specialization_id])
+
+
+
+# ==================== SERVICE COMPONENTS MODEL ====================
+class ServiceComponent(db.Model):
+    __tablename__ = 'service_components'
+    id = db.Column(db.Integer, primary_key=True)
+    service_id = db.Column(db.Integer, db.ForeignKey('services.id', ondelete='CASCADE'), nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    
+    service = db.relationship('Service', foreign_keys=[service_id])
 
 
 class Service(db.Model):
@@ -226,6 +246,7 @@ class ServiceRequest(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     service_id = db.Column(db.Integer, db.ForeignKey('services.id', ondelete='CASCADE'), nullable=False)
     amount = db.Column(db.Float, nullable=False)
+    components_data = db.Column(db.JSON, nullable=True)
     provider_payout = db.Column(db.Float, nullable=False, default=0)
     admin_fee = db.Column(db.Float, nullable=False, default=0)
     site_fee = db.Column(db.Float, nullable=False, default=0)
@@ -478,10 +499,31 @@ def get_current_percentages():
         db.session.commit()
     return setting
 
+
+def get_withdrawal_threshold():
+    """Return the minimum withdrawal amount (default 20 GHS)"""
+    setting = SystemSetting.query.filter_by(key='withdrawal_threshold').first()
+    if setting:
+        try:
+            return float(setting.value)
+        except (ValueError, TypeError):
+            return 20.0
+    return 20.0
+
+def set_withdrawal_threshold(value):
+    """Store the withdrawal threshold in system_settings"""
+    setting = SystemSetting.query.filter_by(key='withdrawal_threshold').first()
+    if setting:
+        setting.value = str(value)
+    else:
+        setting = SystemSetting(key='withdrawal_threshold', value=str(value))
+        db.session.add(setting)
+    db.session.commit()
+    
 # ==================== EMAIL HELPER FUNCTION ====================
 def send_verification_email(user_email, user_name, verification_token):
     try:
-        frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
+        frontend_url = os.environ.get('FRONTEND_URL', 'hhttps://zivre-frontend.vercel.app')
         verification_link = f"{frontend_url}/verify-email?token={verification_token}"
         
         print(f"\n{'='*60}")
@@ -826,23 +868,14 @@ def calculate_commission(referral_pool, level):
     commission = referral_pool * rate
     return round(commission, 2) if commission >= 0.01 else 0
 
-
 def process_referral_commissions(booking, customer):
-    """
-    Process referral commissions using referral_pool_percent from Percentage Settings
-    """
-    self_bonus = 0  
     if booking.commissions_processed:
         return {'already_processed': True, 'total_commissions': booking.total_commissions_paid}
     
-    # Get percentages from GLOBAL settings (NOT from service table)
     percentages = get_current_percentages()
     referral_pool_percent = percentages.referral_pool_percent
-    
-    # Calculate referral pool amount from booking amount
     referral_pool = booking.amount * referral_pool_percent / 100
     
-    # Store snapshots
     booking.referral_pool_amount = referral_pool
     booking.referral_pool_percent_snapshot = referral_pool_percent
     booking.admin_share_percent_snapshot = percentages.admin_percent
@@ -850,16 +883,14 @@ def process_referral_commissions(booking, customer):
     booking.provider_share_percent_snapshot = percentages.provider_percent
     
     total_commissions = 0
-    level = 1
     
-    # Count completed bookings EXCLUDING current one
+    # Self-bonus for first booking
     user_completed_bookings = ServiceRequest.query.filter(
         ServiceRequest.user_id == customer.id,
         ServiceRequest.status == 'confirmed',
         ServiceRequest.id != booking.id
     ).count()
     
-    # Self-bonus for first booking (5% of referral pool)
     if user_completed_bookings == 0:
         self_bonus = referral_pool * 0.05
         if self_bonus >= 0.01:
@@ -874,8 +905,6 @@ def process_referral_commissions(booking, customer):
                 amount=self_bonus
             )
             db.session.add(new_commission)
-            
-            # Notify customer of self-bonus
             socketio.emit('new_commission', {
                 'user_id': customer.id,
                 'amount': self_bonus,
@@ -883,18 +912,18 @@ def process_referral_commissions(booking, customer):
                 'booking_id': booking.id
             }, room=f"user_{customer.id}")
         
-        # User becomes ACTIVE by doing their own service
         customer.is_referral_active = True
     
-    # Process referral chain
+    # Walk up the referral chain, using stored referral_level
     current_user = customer
-    while current_user and current_user.referrer_id and level <= MAX_REFERRAL_DEPTH:
+    while current_user and current_user.referrer_id:
         referrer = db.session.get(User, current_user.referrer_id)
         if not referrer:
             break
         
-        # Calculate commission based on level (geometric decay)
-        rate = BASE_COMMISSION_RATE * (COMMISSION_DECAY_FACTOR ** (level - 1))
+        level = getattr(current_user, 'referral_level', 1)
+        rate_map = {1: 0.20, 2: 0.10, 3: 0.05, 4: 0.025}
+        rate = rate_map.get(level, 0.025)
         commission = referral_pool * rate
         commission = round(commission, 2) if commission >= 0.01 else 0
         
@@ -905,7 +934,6 @@ def process_referral_commissions(booking, customer):
         referrer.total_earned = (referrer.total_earned or 0) + commission
         total_commissions += commission
         
-        # Activate referrer if inactive
         if not referrer.is_referral_active:
             referrer.is_referral_active = True
         
@@ -917,7 +945,6 @@ def process_referral_commissions(booking, customer):
         )
         db.session.add(new_commission)
         
-        # Notify referrer of new commission
         socketio.emit('new_commission', {
             'user_id': referrer.id,
             'amount': commission,
@@ -925,10 +952,8 @@ def process_referral_commissions(booking, customer):
             'booking_id': booking.id
         }, room=f"user_{referrer.id}")
         
-        level += 1
         current_user = referrer
     
-    # Owner net = referral pool minus all commissions paid
     booking.total_commissions_paid = total_commissions
     booking.owner_net = referral_pool - total_commissions
     booking.commissions_processed = True
@@ -941,10 +966,10 @@ def process_referral_commissions(booking, customer):
         'referral_pool': referral_pool,
         'total_commissions': total_commissions,
         'owner_net': booking.owner_net,
-        'levels_processed': level - 1,
+        'levels_processed': level if 'level' in locals() else 0,
         'self_bonus': self_bonus if user_completed_bookings == 0 else 0
     }
-    
+
     
 # ==================== AUTH ROUTES ====================
   # ==================== AUTH ROUTES ====================
@@ -1227,7 +1252,17 @@ def verify_email():
         verification_token=None,
         verification_token_expiry=None
     )
-    
+
+    if referrer_id:
+        earlier_count = User.query.filter_by(referrer_id=referrer_id).count()
+        order_index = earlier_count + 1
+        level = (order_index - 1) // 3 + 1
+        new_user.referral_level = level
+    else:
+        new_user.referral_level = 1
+
+
+        
     db.session.add(new_user)
     db.session.commit()
     
@@ -1626,6 +1661,55 @@ def update_service(service_id):
         print(f"Error updating service: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
+
+@app.route('/api/services/<int:service_id>/components', methods=['GET'])
+@token_required
+def get_service_components(service_id):
+    components = ServiceComponent.query.filter_by(service_id=service_id, is_active=True).all()
+    return jsonify([{
+        'id': c.id,
+        'name': c.name,
+        'price': float(c.price),
+        'is_active': c.is_active
+    } for c in components])
+
+@app.route('/api/admin/services/<int:service_id>/components', methods=['POST'])
+@admin_required
+def add_service_component(service_id):
+    data = request.json
+    component = ServiceComponent(
+        service_id=service_id,
+        name=data['name'],
+        price=float(data['price'])
+    )
+    db.session.add(component)
+    db.session.commit()
+    return jsonify({'id': component.id, 'message': 'Component added'})
+
+@app.route('/api/admin/components/<int:component_id>', methods=['PUT'])
+@admin_required
+def update_component(component_id):
+    data = request.json
+    component = db.session.get(ServiceComponent, component_id)
+    if not component:
+        return jsonify({'error': 'Component not found'}), 404
+    component.name = data.get('name', component.name)
+    component.price = float(data.get('price', component.price))
+    component.is_active = data.get('is_active', component.is_active)
+    db.session.commit()
+    return jsonify({'message': 'Component updated'})
+
+@app.route('/api/admin/components/<int:component_id>', methods=['DELETE'])
+@admin_required
+def delete_component(component_id):
+    component = db.session.get(ServiceComponent, component_id)
+    if not component:
+        return jsonify({'error': 'Component not found'}), 404
+    db.session.delete(component)
+    db.session.commit()
+    return jsonify({'message': 'Component deleted'})
+
 # ==================== QUOTE ROUTES ====================
 
 @app.route('/api/quotes', methods=['POST'])
@@ -1930,40 +2014,58 @@ def admin_delete_comment(comment_id):
 def create_request():
     try:
         data = request.json
-        
-        service = db.session.get(Service, data.get('service_id'))
+        service_id = data.get('service_id')
+        service = db.session.get(Service, service_id)
         if not service:
             return jsonify({'error': 'Service not found'}), 404
-        
         if not service.is_active:
             return jsonify({'error': 'Service is currently inactive'}), 400
         
-        customer_phone = data.get('customer_phone', request.current_user.phone)
+        # Calculate amount: either fixed price OR sum of components
+        components_data = data.get('components_data', [])
+        if components_data:
+            total_amount = sum(item['quantity'] * item['price'] for item in components_data)
+            components_json = [{
+                'component_id': item['component_id'],
+                'name': item['name'],
+                'quantity': item['quantity'],
+                'unit_price': item['price'],
+                'subtotal': item['quantity'] * item['price']
+            } for item in components_data]
+        else:
+            total_amount = service.total_price
+            components_json = None
+        
+        percentages = get_current_percentages()
+        provider_payout = total_amount * (percentages.provider_percent / 100)
+        admin_fee = total_amount * (percentages.admin_percent / 100)
+        site_fee = total_amount * (percentages.site_fee_percent / 100)
         
         new_request = ServiceRequest(
             user_id=request.current_user.id,
-            service_id=data.get('service_id'),
-            amount=service.total_price,
-            provider_payout=service.provider_payout,
-            admin_fee=service.admin_fee,
-            site_fee=service.site_fee,
+            service_id=service_id,
+            amount=total_amount,
+            provider_payout=provider_payout,
+            admin_fee=admin_fee,
+            site_fee=site_fee,
             location_address=data.get('location_address', ''),
             location_city=data.get('location_city', ''),
             location_region=data.get('location_region', ''),
             location_landmark=data.get('location_landmark', ''),
-            customer_phone=customer_phone,
+            customer_phone=data.get('customer_phone', request.current_user.phone),
+            components_data=components_json,
             status='pending_approval'
         )
         db.session.add(new_request)
         db.session.commit()
         
-        create_notification(request.current_user.id, f'📝 Your request for {service.name} has been submitted. Admin will review and assign a provider. You will pay the provider directly after service completion.', 'info', '/customer/dashboard')
+        create_notification(request.current_user.id, f'📝 Your request for {service.name} has been submitted. Admin will review and assign a provider.', 'info', '/customer/dashboard')
         
         socketio.emit('new_request', {
             'id': new_request.id,
             'customer_name': request.current_user.full_name,
             'service_name': service.name,
-            'amount': service.total_price,
+            'amount': total_amount,
             'created_at': new_request.created_at.isoformat()
         }, room='role_admin')
         
@@ -1973,7 +2075,7 @@ def create_request():
             'status': 'pending_approval'
         }, room=f"user_{request.current_user.id}")
         
-        return jsonify({'message': 'Request submitted successfully! Admin will review and assign a provider. Payment will be made directly to the provider.', 'request_id': new_request.id, 'amount': service.total_price})
+        return jsonify({'message': 'Request submitted successfully!', 'request_id': new_request.id, 'amount': total_amount})
     
     except Exception as e:
         db.session.rollback()
@@ -1995,6 +2097,7 @@ def get_user_requests(user_id):
                     'id': r.id,
                     'service_name': r.service.name if r.service else 'Unknown',
                     'amount': r.amount,
+                    'components_data': r.components_data,
                     'provider_payout': r.provider_payout,
                     'admin_fee': r.admin_fee,
                     'site_fee': r.site_fee,
@@ -2279,7 +2382,8 @@ def get_available_jobs():
         'location_region': req.location_region,
         'location_landmark': req.location_landmark,
         'amount': req.amount,
-        'provider_payout': req.provider_payout
+        'provider_payout': req.provider_payout,
+        'components_data': req.components_data
     } for req in available_jobs])
 
 @app.route('/api/jobs/claim', methods=['POST'])
@@ -2345,6 +2449,7 @@ def get_provider_jobs(provider_id):
         'status': j.status,
         'amount': j.amount,
         'provider_payout': j.provider_payout,
+        'components_data': j.components_data,
         'rating': j.rating,
         'customer_confirmed': j.customer_confirmed,
         'provider_completed': j.provider_completed,
@@ -3051,6 +3156,7 @@ def get_all_requests():
         'id': r.id,
         'user_id': r.user_id,
         'customer_name': r.user.full_name if r.user else 'Unknown',
+        'components_data': r.components_data,
         'customer_phone': r.customer_phone or (r.user.phone if r.user else 'Unknown'),
         'service_name': r.service.name if r.service else 'Unknown',
         'service_id': r.service_id,
@@ -3218,6 +3324,31 @@ def update_payment_settings():
     
     return jsonify({'message': 'Payment settings updated successfully'})
 
+
+@app.route('/api/settings/withdrawal-threshold', methods=['GET'])
+@token_required
+def get_withdrawal_threshold_route():
+    threshold = get_withdrawal_threshold()
+    return jsonify({'threshold': threshold})
+
+@app.route('/api/admin/settings/withdrawal-threshold', methods=['PUT'])
+@admin_required
+def update_withdrawal_threshold():
+    data = request.json
+    try:
+        new_threshold = float(data.get('threshold', 20))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Threshold must be a number'}), 400
+    
+    if new_threshold < 5:
+        return jsonify({'error': 'Threshold cannot be less than 5 GHS'}), 400
+    if new_threshold > 1000:
+        return jsonify({'error': 'Threshold cannot exceed 1000 GHS'}), 400
+    
+    set_withdrawal_threshold(new_threshold)
+    socketio.emit('withdrawal_threshold_updated', {'threshold': new_threshold})
+    return jsonify({'message': 'Withdrawal threshold updated', 'threshold': new_threshold})
+    
 # ==================== SESSION KEEP ALIVE ====================
 
 @app.route('/api/auth/ping', methods=['GET'])
@@ -3362,7 +3493,34 @@ def init_db():
         print("✅ Referral codes generated for existing users")
     except Exception as e:
         print(f"⚠️ Referral codes note: {e}")
+                   
+    # 10. Add new columns if they don't exist
+    try:
+        db.session.execute(text('ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS components_data JSON'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS direct_referral_count INTEGER DEFAULT 0'))
+        db.session.execute(text('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_level INTEGER DEFAULT 1'))
+        db.session.commit()
+        print("✅ Added components_data, direct_referral_count, referral_level columns")
+    except Exception as e:
+        print(f"⚠️ Column addition warning: {e}")
     
+    # Create service_components table if not exists
+    try:
+        db.session.execute(text('''
+            CREATE TABLE IF NOT EXISTS service_components (
+                id SERIAL PRIMARY KEY,
+                service_id INTEGER REFERENCES services(id) ON DELETE CASCADE,
+                name VARCHAR(200) NOT NULL,
+                price DECIMAL(10,2) NOT NULL,
+                is_active BOOLEAN DEFAULT true,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP
+            )
+        '''))
+        db.session.commit()
+        print("✅ Service components table created")
+    except Exception as e:
+        print(f"⚠️ Service components table note: {e}")
     # ============================================
     # END OF REFERRAL SYSTEM MIGRATION
     # ============================================
@@ -3780,9 +3938,10 @@ def request_withdrawal():
     payment_method = data.get('payment_method')
     account_details = data.get('account_details')
     
-    if not amount or amount < WITHDRAWAL_THRESHOLD_GHS:
-        return jsonify({'error': f'Minimum withdrawal amount is GHS{WITHDRAWAL_THRESHOLD_GHS}'}), 400
-    
+    threshold = get_withdrawal_threshold()
+    if not amount or amount < threshold:
+        return jsonify({'error': f'Minimum withdrawal amount is GHS{threshold}'}), 400
+        
     if amount > (user.commission_balance or 0):
         return jsonify({'error': 'Insufficient balance'}), 400
     
@@ -3877,7 +4036,7 @@ def get_referral_kpis():
         'total_earned': float(user.total_earned or 0),
         'current_balance': float(user.commission_balance or 0),
         'is_referral_active': user.is_referral_active,
-        'withdrawal_threshold': WITHDRAWAL_THRESHOLD_GHS
+        'withdrawal_threshold': get_withdrawal_threshold()
     })
 
 # ==================== ADMIN REFERRAL ENDPOINTS ====================
