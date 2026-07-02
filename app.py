@@ -22,8 +22,8 @@ from flask_limiter.util import get_remote_address
 from sqlalchemy import text
 import mimetypes
 import jwt
-import sendgrid
-from sendgrid.helpers.mail import Mail
+#import sendgrid
+#from sendgrid.helpers.mail import Mail
 
 load_dotenv()
 
@@ -523,15 +523,19 @@ def set_withdrawal_threshold(value):
 # ==================== EMAIL HELPER FUNCTION ====================
 def send_verification_email(user_email, user_name, verification_token):
     try:
-        frontend_url = os.environ.get('FRONTEND_URL', 'hhttps://zivre-frontend.vercel.app')
+        frontend_url = os.environ.get('FRONTEND_URL', 'https://zivre-frontend.vercel.app')
         verification_link = f"{frontend_url}/verify-email?token={verification_token}"
         
         print(f"\n{'='*60}")
-        print(f"📧 VERIFICATION LINK:")
-        print(f"{verification_link}")
+        print(f"VERIFICATION LINK: {verification_link}")
         print(f"{'='*60}\n")
         
-        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
+        import brevo_python
+        from brevo_python.rest import ApiException
+        
+        configuration = brevo_python.Configuration()
+        configuration.api_key['api-key'] = os.environ.get('BREVO_API_KEY')
+        api_instance = brevo_python.TransactionalEmailsApi(brevo_python.ApiClient(configuration))
         
         html_content = f"""
         <!DOCTYPE html>
@@ -549,25 +553,20 @@ def send_verification_email(user_email, user_name, verification_token):
         </html>
         """
         
-        message = Mail(
-            from_email="zivrefaserve@gmail.com",
-            to_emails=user_email,
+        send_smtp_email = brevo_python.SendSmtpEmail(
+            to=[{"email": user_email, "name": user_name}],
+            sender={"email": "zivrefaserve@gmail.com", "name": "Zivre Facility Services"},
             subject="Verify Your Zivre Email Address",
             html_content=html_content
         )
         
-        response = sg.send(message)
-        
-        if response.status_code == 202:
-            print(f"✅ Verification email sent to {user_email}")
-        else:
-            print(f"⚠️ SendGrid status: {response.status_code}")
-        
+        api_instance.send_transac_email(send_smtp_email)
+        print(f"Verification email sent to {user_email} via Brevo")
         return True
         
     except Exception as e:
-        print(f"❌ SendGrid error: {str(e)}")
-        print(f"📧 Manual link: {verification_link}")
+        print(f"Brevo error: {str(e)}")
+        print(f"Manual link: {verification_link}")
         return True
 
 # Same function for password reset
@@ -577,11 +576,15 @@ def send_reset_email(user_email, user_name, reset_token):
         reset_link = f"{frontend_url}/reset-password?token={reset_token}"
         
         print(f"\n{'='*60}")
-        print(f"🔐 RESET LINK:")
-        print(f"{reset_link}")
+        print(f"RESET LINK: {reset_link}")
         print(f"{'='*60}\n")
         
-        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
+        import brevo_python
+        from brevo_python.rest import ApiException
+        
+        configuration = brevo_python.Configuration()
+        configuration.api_key['api-key'] = os.environ.get('BREVO_API_KEY')
+        api_instance = brevo_python.TransactionalEmailsApi(brevo_python.ApiClient(configuration))
         
         html_content = f"""
         <!DOCTYPE html>
@@ -597,21 +600,22 @@ def send_reset_email(user_email, user_name, reset_token):
         </html>
         """
         
-        message = Mail(
-            from_email="zivrefaserve@gmail.com",
-            to_emails=user_email,
+        send_smtp_email = brevo_python.SendSmtpEmail(
+            to=[{"email": user_email, "name": user_name}],
+            sender={"email": "zivrefaserve@gmail.com", "name": "Zivre Facility Services"},
             subject="Reset Your Zivre Password",
             html_content=html_content
         )
         
-        response = sg.send(message)
-        print(f"✅ Reset email sent to {user_email}")
+        api_instance.send_transac_email(send_smtp_email)
+        print(f"Reset email sent to {user_email} via Brevo")
         return True
         
     except Exception as e:
-        print(f"❌ SendGrid error: {str(e)}")
-        print(f"🔐 Manual reset link: {reset_link}")
+        print(f"Brevo error: {str(e)}")
+        print(f"Manual reset link: {reset_link}")
         return True
+        
 # ==================== WEBSOCKET EVENTS ====================
 
 @socketio.on('connect')
